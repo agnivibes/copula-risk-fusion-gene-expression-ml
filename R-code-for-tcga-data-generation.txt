@@ -1,0 +1,211 @@
+library(data.table)
+library(dplyr)
+
+# ============================================================
+# 1. READ & CLEAN CLINICAL DATA (TCGA)
+# ============================================================
+
+clinical_raw <- fread("data_clinical_patient.txt", skip = 4)
+colnames(clinical_raw) <- make.names(colnames(clinical_raw))
+
+clinical_raw <- clinical_raw %>%
+  mutate(across(everything(), ~trimws(.))) %>%
+  mutate(across(everything(), ~na_if(., "")))
+
+clinical <- clinical_raw %>%
+  mutate(
+    patient_id = PATIENT_ID,
+    age_at_diagnosis = as.numeric(AGE),
+    
+    tumor_stage = AJCC_PATHOLOGIC_TUMOR_STAGE,
+    tumor_size = PATH_T_STAGE,
+    lymph_nodes = PATH_N_STAGE,
+    metastasis_stage = PATH_M_STAGE,
+    
+    subtype = SUBTYPE,
+    race = RACE,
+    radiation_therapy = RADIATION_THERAPY,
+    
+    overall_survival_months = as.numeric(OS_MONTHS),
+    
+    overall_survival = ifelse(
+      grepl("DECEASED", OS_STATUS), 1, 0
+    ),
+    
+    death_from_cancer = case_when(
+      grepl("DECEASED", OS_STATUS) ~ "Died",
+      grepl("LIVING", OS_STATUS) ~ "Living",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    patient_id,
+    age_at_diagnosis,
+    tumor_stage,
+    tumor_size,
+    lymph_nodes,
+    metastasis_stage,
+    subtype,
+    race,
+    radiation_therapy,
+    death_from_cancer,
+    overall_survival_months,
+    overall_survival
+  ) %>%
+  filter(
+    !is.na(patient_id),
+    !is.na(overall_survival_months),
+    !is.na(overall_survival)
+  )
+
+# ---------------- STAGING CLEAN ----------------
+
+clinical$tumor_stage <- trimws(clinical$tumor_stage)
+
+clinical$tumor_stage <- case_when(
+  grepl("IV", clinical$tumor_stage) ~ "Stage IV",
+  grepl("III", clinical$tumor_stage) ~ "Stage III",
+  grepl("II", clinical$tumor_stage) ~ "Stage II",
+  grepl("I", clinical$tumor_stage) ~ "Stage I",
+  TRUE ~ NA_character_
+)
+
+clinical$tumor_size <- substr(clinical$tumor_size, 1, 2)
+clinical$lymph_nodes <- substr(clinical$lymph_nodes, 1, 2)
+clinical$metastasis_stage <- substr(clinical$metastasis_stage, 1, 2)
+
+clinical$race <- ifelse(
+  clinical$race %in% c("White", "Black or African American", "Asian"),
+  clinical$race,
+  ifelse(is.na(clinical$race), NA, "Other")
+)
+
+clinical$metastasis_stage <- ifelse(
+  clinical$metastasis_stage %in% c("M0", "M1"),
+  clinical$metastasis_stage,
+  NA
+)
+
+clinical <- clinical %>% filter(!is.na(subtype))
+
+library(data.table)
+library(dplyr)
+
+# ============================================================
+# FUNCTION: CLEAN NAMES
+# ============================================================
+
+clean_names <- function(x) {
+  x <- toupper(trimws(x))
+  x <- gsub("[^A-Z0-9_]", "_", x)
+  x <- gsub("^([0-9])", "X\\1", x)
+  x <- gsub("_+", "_", x)
+  x
+}
+
+# ============================================================
+# 1. LOAD METABRIC
+# ============================================================
+
+metabric <- fread("METABRIC_RNA_Mutation.csv")
+
+colnames(metabric) <- clean_names(colnames(metabric))
+
+# ---------------- CLINICAL VARIABLES ----------------
+clinical_vars <- c(
+  "PATIENT_ID","AGE_AT_DIAGNOSIS","TYPE_OF_BREAST_SURGERY",
+  "CANCER_TYPE","CANCER_TYPE_DETAILED","CELLULARITY",
+  "CHEMOTHERAPY","PAM50_+_CLAUDIN-LOW_SUBTYPE","COHORT",
+  "ER_STATUS_MEASURED_BY_IHC","ER_STATUS",
+  "NEOPLASM_HISTOLOGIC_GRADE",
+  "HER2_STATUS_MEASURED_BY_SNP6","HER2_STATUS",
+  "TUMOR_OTHER_HISTOLOGIC_SUBTYPE","HORMONE_THERAPY",
+  "INFERRED_MENOPAUSAL_STATE","INTEGRATIVE_CLUSTER",
+  "PRIMARY_TUMOR_LATERALITY","LYMPH_NODES_EXAMINED_POSITIVE",
+  "MUTATION_COUNT","NOTTINGHAM_PROGNOSTIC_INDEX",
+  "ONCOTREE_CODE","OVERALL_SURVIVAL_MONTHS",
+  "OVERALL_SURVIVAL","PR_STATUS","RADIO_THERAPY",
+  "3-GENE_CLASSIFIER_SUBTYPE","TUMOR_SIZE",
+  "TUMOR_STAGE","DEATH_FROM_CANCER"
+)
+
+clinical_vars <- clean_names(clinical_vars)
+
+# ---------------- REMOVE _MUT ----------------
+metabric_clean <- metabric[, !grepl("_MUT$", colnames(metabric)), with = FALSE]
+
+# ---------------- GENE SET ----------------
+metabric_genes <- setdiff(colnames(metabric_clean), clinical_vars)
+
+cat("METABRIC genes:", length(metabric_genes), "\n")  # 489
+
+
+# ============================================================
+# 2. LOAD TCGA EXPRESSION
+# ============================================================
+
+expr_raw <- fread("data_mrna_seq_v2_rsem_zscores_ref_all_samples.txt")
+
+expr_raw <- expr_raw[!is.na(Hugo_Symbol) & Hugo_Symbol != ""]
+expr_raw <- expr_raw[!duplicated(Hugo_Symbol)]
+
+expr_matrix <- as.matrix(expr_raw[, -c(1,2)])
+rownames(expr_matrix) <- clean_names(expr_raw$Hugo_Symbol)
+
+tcga_expr <- as.data.frame(t(expr_matrix))
+
+# -------- FIX: CREATE patient_id BEFORE REMOVING ROWNAMES --------
+tcga_expr$patient_id <- substr(rownames(tcga_expr), 1, 12)
+
+# remove rownames AFTER extraction
+rownames(tcga_expr) <- NULL
+
+# move patient_id first
+tcga_expr <- tcga_expr[, c("patient_id", setdiff(colnames(tcga_expr), "patient_id"))]
+
+# clean gene names
+colnames(tcga_expr)[-1] <- clean_names(colnames(tcga_expr)[-1])
+
+
+# ============================================================
+# 3. MATCH GENES
+# ============================================================
+
+tcga_genes <- colnames(tcga_expr)[-1]
+
+common_genes <- intersect(metabric_genes, tcga_genes)
+
+cat("Common genes:", length(common_genes), "\n")  # ~476
+
+missing_genes <- setdiff(metabric_genes, tcga_genes)
+cat("Missing genes:", length(missing_genes), "\n")
+
+
+# ============================================================
+# 4. ALIGN DATA
+# ============================================================
+
+# TCGA
+tcga_aligned <- tcga_expr[, c("patient_id", common_genes), drop = FALSE]
+
+# METABRIC
+metabric_clean$patient_id <- metabric_clean$PATIENT_ID
+metabric_aligned <- metabric_clean[, c("patient_id", common_genes), with = FALSE]
+
+
+# ============================================================
+# 5. MERGE WITH CLINICAL
+# ============================================================
+
+final_tcga <- merge(clinical, tcga_aligned, by = "patient_id")
+
+cat("Final dataset shape:", dim(final_tcga), "\n")
+
+
+# ============================================================
+# 6. SAVE
+# ============================================================
+
+fwrite(final_tcga, "tcga_final_dataset.csv")
+fwrite(common_genes, "common_genes.txt")
+fwrite(missing_genes, "missing_genes.txt")
