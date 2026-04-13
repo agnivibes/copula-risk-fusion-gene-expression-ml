@@ -71,7 +71,7 @@ This repository contains two main analysis scripts:
 Runs the full primary analysis pipeline on the METABRIC cohort, including clinical and gene-expression ML model training, copula fitting (Gaussian, Clayton, Gumbel, Frank), goodness-of-fit testing, joint risk stratification, Kaplan–Meier survival analysis, and competing-risks cumulative incidence analysis. Outputs are saved to `study1_outputs/`.
 
 ```bash
-python copula-risk-fusion-genomics-ml.py
+python copula-risk-fusion-gene-expression-ml.py
 ```
 
 **Script 2 — External Validation in TCGA** (`external_validation_tcga.py`):
