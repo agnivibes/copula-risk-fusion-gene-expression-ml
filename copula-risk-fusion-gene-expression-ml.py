@@ -648,15 +648,22 @@ def plot_copula_heatmap(u, v, copula_cdf, params, outdir, name):
 # ======================================================================
 
 def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
-                        model_gen, expr_cols, outdir):
+                        model_gen, expr_cols, outdir,
+                        oof_pid=None, oof_clin=None, oof_gen=None):
     """
     Cumulative incidence functions treating 'Died of Other Causes'
     as a competing event, using the Aalen-Johansen estimator.
 
     Uses the FULL dataset (not the analytic cohort) so that competing
-    deaths are present in the event coding.  Risk scores are obtained
-    by applying the already-fitted clinical and gene-expression models
-    to all patients.
+    deaths are present in the event coding.
+
+    Risk scores are constructed to avoid in-sample optimism in the risk-group
+    definition. Patients in the analytic cohort receive their leakage-free
+    out-of-fold (cross-validated) risk scores; the remaining patients (those
+    excluded from the endpoint, e.g. other-cause deaths, who were never used to
+    train any model) receive genuine out-of-sample predictions from the fitted
+    models. If out-of-fold scores are not supplied, the function falls back to
+    scoring all patients with the fitted models.
     """
     try:
         from lifelines import AalenJohansenFitter
@@ -674,7 +681,9 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
         print("  Skipping competing-risks plot.")
         return
 
-    # Predict risk scores for the full dataset using fitted models
+    # Predict risk scores for the full dataset using fitted models. For patients
+    # who were excluded from the analytic cohort (never in any training fold),
+    # these are genuine out-of-sample predictions.
     try:
         risk_clin = model_clin.predict_proba(df_full[clinical_ml_cols])[:, 1]
         risk_gen = model_gen.predict_proba(df_full[expr_cols])[:, 1]
@@ -682,6 +691,20 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
         print(f"  Could not score full dataset for CIF: {e}")
         print("  Skipping competing-risks plot.")
         return
+
+    # Overwrite analytic-cohort patients with their leakage-free out-of-fold
+    # scores so that the risk-group definition is not circular.
+    if oof_pid is not None and "patient_id" in df_full.columns:
+        cmap = {str(p): float(s) for p, s in zip(oof_pid, oof_clin)}
+        gmap = {str(p): float(s) for p, s in zip(oof_pid, oof_gen)}
+        pid_full = df_full["patient_id"].astype(str).values
+        n_oof = 0
+        for i, pid in enumerate(pid_full):
+            if pid in cmap:
+                risk_clin[i] = cmap[pid]; risk_gen[i] = gmap[pid]; n_oof += 1
+        print(f"  CIF risk scores: {n_oof} analytic patients use out-of-fold "
+              f"scores; {len(pid_full) - n_oof} excluded patients use "
+              f"out-of-sample predictions.")
 
     time = df_full["overall_survival_months"].astype(float).values
     raw = df_full["death_from_cancer"].astype(str).str.strip().str.lower()
@@ -760,6 +783,208 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
 # ======================================================================
 # 9.  MAIN PIPELINE
 # ======================================================================
+
+# ======================================================================
+# 8b.  CALIBRATION ASSESSMENT  (Editor point 1: Hosmer-Lemeshow etc.)
+# ======================================================================
+
+def hosmer_lemeshow(y, p, g=10):
+    """Hosmer-Lemeshow goodness-of-fit test using g equal-count bins of
+    predicted risk. Returns chi-square statistic, degrees of freedom (bins-2),
+    and p-value. Rank-based binning avoids degenerate quantile edges."""
+    y = np.asarray(y, float); p = np.asarray(p, float)
+    n = len(p)
+    order = np.argsort(p, kind="mergesort")
+    grp = np.empty(n, int)
+    grp[order] = np.floor(np.arange(n) * g / n).astype(int)
+    chi2 = 0.0; used = 0
+    for b in range(g):
+        m = grp == b
+        if m.sum() == 0:
+            continue
+        obs1, exp1 = y[m].sum(), p[m].sum()
+        obs0, exp0 = m.sum() - obs1, m.sum() - exp1
+        for obs, exp in ((obs1, exp1), (obs0, exp0)):
+            if exp > 0:
+                chi2 += (obs - exp) ** 2 / exp
+        used += 1
+    dof = max(used - 2, 1)
+    return {"chi2": float(chi2), "dof": int(dof),
+            "p_value": float(stats.chi2.sf(chi2, dof)), "n_bins": used}
+
+
+def calibration_slope_intercept(y, p, eps=1e-6):
+    """Calibration slope (logistic reg of y on logit(p)) and calibration
+    intercept-in-the-large (Newton step on intercept with slope fixed at 1).
+    Ideal slope=1, intercept=0; slope<1 indicates over-dispersed risks."""
+    y = np.asarray(y, float); p = np.clip(np.asarray(p, float), eps, 1 - eps)
+    logit = np.log(p / (1 - p)).reshape(-1, 1)
+    lr = LogisticRegression(penalty=None, solver="lbfgs", max_iter=1000)
+    lr.fit(logit, y)
+    slope = float(lr.coef_[0, 0])
+    a = 0.0
+    for _ in range(100):
+        mu = 1 / (1 + np.exp(-(a + logit.ravel())))
+        grad = np.sum(y - mu); hess = -np.sum(mu * (1 - mu))
+        if abs(hess) < 1e-12:
+            break
+        step = grad / hess; a -= step
+        if abs(step) < 1e-10:
+            break
+    return {"slope": slope, "intercept": float(a)}
+
+
+def integrated_calibration_index(y, p):
+    """ICI: mean |predicted - isotonic-smoothed observed| risk."""
+    from sklearn.isotonic import IsotonicRegression
+    y = np.asarray(y, float); p = np.asarray(p, float)
+    obs = IsotonicRegression(out_of_bounds="clip").fit_transform(p, y)
+    return float(np.mean(np.abs(obs - p)))
+
+
+def calibration_report(scores_dict, y, outdir, tag="metabric"):
+    """Compute HL test, calibration slope/intercept, Brier, and ICI for each
+    named probability score, and save a reliability-curve figure + CSV."""
+    from sklearn.calibration import calibration_curve
+    y = np.asarray(y, float)
+    rows = []
+    plt.figure(figsize=(6, 6))
+    plt.plot([0, 1], [0, 1], "k--", alpha=0.6, label="Perfect calibration")
+    for name, p in scores_dict.items():
+        p = np.asarray(p, float)
+        hl = hosmer_lemeshow(y, p)
+        si = calibration_slope_intercept(y, p)
+        brier = float(np.mean((p - y) ** 2))
+        ici = integrated_calibration_index(y, p)
+        rows.append({"score": name, "brier": brier,
+                     "hl_chi2": hl["chi2"], "hl_dof": hl["dof"],
+                     "hl_p_value": hl["p_value"],
+                     "calibration_slope": si["slope"],
+                     "calibration_intercept": si["intercept"],
+                     "ici": ici})
+        frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="quantile")
+        plt.plot(mean_pred, frac_pos, marker="o", label=f"{name} (HL p={hl['p_value']:.2f})")
+        print(f"  [{name}] Brier={brier:.4f}  HL p={hl['p_value']:.3f}  "
+              f"slope={si['slope']:.3f}  intercept={si['intercept']:.3f}  ICI={ici:.4f}")
+    plt.xlabel("Mean predicted risk"); plt.ylabel("Observed event fraction")
+    plt.title(f"Calibration ({tag})"); plt.legend(loc="upper left")
+    plt.tight_layout(); plt.savefig(outdir / f"calibration_{tag}.png", dpi=300); plt.close()
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv(outdir / f"calibration_{tag}.csv", index=False)
+    return df_out
+
+
+# ======================================================================
+# 8c.  FEATURE IMPORTANCE  (Editor point 3: key genes + interpretability)
+# ======================================================================
+
+def feature_importance_report(fitted_model, X, y, cols, view_name, outdir,
+                              topn=20, n_repeats=20, test_size=0.30,
+                              random_state=42):
+    """Feature importance for a fitted pipeline over the ORIGINAL predictor
+    columns, computed two complementary ways:
+
+      * Out-of-sample permutation importance (scoring=ROC-AUC): the pipeline is
+        refit on a stratified training split and each column is permuted on a
+        held-out split. This avoids the in-sample saturation that makes
+        permutation importance vanish for a memorised high-dimensional model.
+      * Impurity (Gini) importance from the final tree ensemble, when available,
+        which is the conventional and robust choice for highly correlated
+        gene-expression predictors.
+
+    The table is ranked by impurity importance when the final estimator is a
+    tree ensemble whose importances align 1-to-1 with the input columns (the
+    numeric-only gene-expression view); otherwise it is ranked by out-of-sample
+    permutation importance (the mixed-type clinical view)."""
+    from sklearn.inspection import permutation_importance
+    from sklearn.base import clone
+    from sklearn.model_selection import train_test_split
+
+    Xc = X[cols]
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        Xc, y, test_size=test_size, stratify=y, random_state=random_state)
+    est = clone(fitted_model)
+    est.fit(X_tr, y_tr)
+    r = permutation_importance(est, X_te, y_te, scoring="roc_auc",
+                               n_repeats=n_repeats, random_state=random_state,
+                               n_jobs=-1)
+    imp = pd.DataFrame({"feature": cols,
+                        "perm_importance_mean": r.importances_mean,
+                        "perm_importance_std": r.importances_std})
+
+    rank_col = "perm_importance_mean"
+    try:
+        clf = est.named_steps["clf"]
+        fi = getattr(clf, "feature_importances_", None)
+        if fi is not None and len(fi) == len(cols):
+            imp["impurity_importance"] = fi
+            rank_col = "impurity_importance"
+    except Exception:
+        pass
+
+    imp = imp.sort_values(rank_col, ascending=False).reset_index(drop=True)
+    imp.to_csv(outdir / f"feature_importance_{view_name}.csv", index=False)
+
+    top = imp.head(topn).iloc[::-1]
+    plt.figure(figsize=(7, max(4, 0.32 * len(top))))
+    if rank_col == "impurity_importance":
+        plt.barh(top["feature"], top["impurity_importance"], color="#4C72B0")
+        plt.xlabel("Random-forest impurity importance")
+    else:
+        plt.barh(top["feature"], top["perm_importance_mean"],
+                 xerr=top["perm_importance_std"], color="#4C72B0")
+        plt.xlabel("Out-of-sample permutation importance (mean AUC drop)")
+    plt.title(f"Top {topn} features — {view_name}")
+    plt.tight_layout(); plt.savefig(outdir / f"feature_importance_{view_name}.png", dpi=300)
+    plt.close()
+    print(f"  [{view_name}] ranked by {rank_col}; top features: "
+          + ", ".join(imp['feature'].head(12).tolist()))
+    return imp
+
+
+# ======================================================================
+# 8d.  SIMPLE FUSION BASELINES  (referee-proofing: is the copula needed?)
+# ======================================================================
+
+def fusion_baselines(risk_clin, risk_gen, u, v, y, copula_fused, outdir,
+                     random_state=42):
+    """Compare the copula-fused score against simple score-level fusion
+    baselines, so that the added value (or not) of the copula is explicit:
+
+      * rank-average fusion:  mean of the two pseudo-observations (u, v);
+      * probability-average fusion:  mean of the two predicted probabilities;
+      * logistic stacking:  logistic regression of the outcome on the two
+        out-of-fold risk scores, itself evaluated with 5-fold cross-validation
+        (so the stacker is never trained and tested on the same patient).
+
+    All scores are ranking scores, so we compare them by ROC-AUC with matched
+    bootstrap confidence intervals."""
+    rank_avg = (np.asarray(u) + np.asarray(v)) / 2.0
+    prob_avg = (np.asarray(risk_clin) + np.asarray(risk_gen)) / 2.0
+
+    Xs = np.column_stack([np.asarray(risk_clin), np.asarray(risk_gen)])
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    stack = cross_val_predict(
+        LogisticRegression(max_iter=1000), Xs, y, cv=skf,
+        method="predict_proba")[:, 1]
+
+    scores = {
+        "clinical": np.asarray(risk_clin),
+        "gene-expression": np.asarray(risk_gen),
+        "copula-fused": np.asarray(copula_fused),
+        "rank-average": rank_avg,
+        "probability-average": prob_avg,
+        "logistic-stacking (CV)": stack,
+    }
+    rows = []
+    for name, s in scores.items():
+        a, lo, hi = bootstrap_auc_ci(y.values if hasattr(y, "values") else y, s)
+        rows.append({"score": name, "auc": a, "ci_lo": lo, "ci_hi": hi})
+        print(f"  {name:24s} AUC = {a:.4f} [{lo:.4f}, {hi:.4f}]")
+    out = pd.DataFrame(rows)
+    out.to_csv(outdir / "fusion_baselines.csv", index=False)
+    return out
+
 
 def main():
     outdir = Path("study1_outputs")
@@ -844,7 +1069,9 @@ def main():
     # Risk scores are generated by applying the fitted models to all patients.
     df_full = load_metabric()
     competing_risks_cif(df_full, model_c, clinical_ml_cols,
-                        model_g, expr_cols, outdir)
+                        model_g, expr_cols, outdir,
+                        oof_pid=df["patient_id"].values,
+                        oof_clin=risk_clin, oof_gen=risk_gen)
 
     # ==================================================================
     # COPULA ANALYSIS
@@ -940,6 +1167,30 @@ def main():
                     outdir,
                     ci_dict={"clinical": (lo_c, hi_c),
                              "gene-expression": (lo_g, hi_g)})
+
+    # ---- Simple fusion baselines (is the copula needed?) ----
+    print("\n" + "="*60)
+    print("FUSION BASELINES (copula vs simple score-level fusion)")
+    print("="*60)
+    fusion_df = fusion_baselines(risk_clin, risk_gen, u, v, y, joint_score, outdir)
+
+    # ---- Calibration assessment (Editor point 1: Hosmer-Lemeshow etc.) ----
+    print("\n" + "="*60)
+    print("CALIBRATION ASSESSMENT (5-year cancer-specific death, METABRIC)")
+    print("="*60)
+    calib_df = calibration_report(
+        {"clinical": risk_clin, "gene-expression": risk_gen}, y, outdir,
+        tag="metabric_cancer_specific")
+    print(f"\n  Calibration summary:\n{calib_df.to_string(index=False)}")
+
+    # ---- Feature importance (Editor point 3: key genes + interpretability) ----
+    print("\n" + "="*60)
+    print("FEATURE IMPORTANCE (permutation, ROC-AUC)")
+    print("="*60)
+    imp_gene = feature_importance_report(
+        model_g, df, y, expr_cols, "gene-expression", outdir, topn=20)
+    imp_clin = feature_importance_report(
+        model_c, df, y, clinical_ml_cols, "clinical", outdir, topn=15)
 
     print(f"\n{'='*60}")
     print("PIPELINE COMPLETE — outputs in 'study1_outputs/'")
