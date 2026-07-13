@@ -454,6 +454,104 @@ def plot_roc(y_true, scores, labels, savepath):
     plt.close()
 
 # ============================================================
+# 5b. CALIBRATION  (Editor point 1: Hosmer-Lemeshow etc.)
+# ============================================================
+def hosmer_lemeshow(y, p, g=10):
+    y = np.asarray(y, float); p = np.asarray(p, float)
+    n = len(p)
+    order = np.argsort(p, kind='mergesort')
+    grp = np.empty(n, int)
+    grp[order] = np.floor(np.arange(n) * g / n).astype(int)
+    chi2 = 0.0; used = 0
+    for b in range(g):
+        m = grp == b
+        if m.sum() == 0:
+            continue
+        obs1, exp1 = y[m].sum(), p[m].sum()
+        obs0, exp0 = m.sum() - obs1, m.sum() - exp1
+        for obs, exp in ((obs1, exp1), (obs0, exp0)):
+            if exp > 0:
+                chi2 += (obs - exp) ** 2 / exp
+        used += 1
+    dof = max(used - 2, 1)
+    return {'chi2': float(chi2), 'dof': int(dof),
+            'p_value': float(stats.chi2.sf(chi2, dof)), 'n_bins': used}
+
+
+def calibration_slope_intercept(y, p, eps=1e-6):
+    y = np.asarray(y, float); p = np.clip(np.asarray(p, float), eps, 1 - eps)
+    logit = np.log(p / (1 - p)).reshape(-1, 1)
+    lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000)
+    lr.fit(logit, y)
+    slope = float(lr.coef_[0, 0])
+    a = 0.0
+    for _ in range(100):
+        mu = 1 / (1 + np.exp(-(a + logit.ravel())))
+        grad = np.sum(y - mu); hess = -np.sum(mu * (1 - mu))
+        if abs(hess) < 1e-12:
+            break
+        step = grad / hess; a -= step
+        if abs(step) < 1e-10:
+            break
+    return {'slope': slope, 'intercept': float(a)}
+
+
+def integrated_calibration_index(y, p):
+    from sklearn.isotonic import IsotonicRegression
+    y = np.asarray(y, float); p = np.asarray(p, float)
+    obs = IsotonicRegression(out_of_bounds='clip').fit_transform(p, y)
+    return float(np.mean(np.abs(obs - p)))
+
+
+def recalibrate_map(y_ref, s_ref):
+    """Fit a logistic recalibration map prob = sigmoid(a + b*s) on reference
+    (internal) data; return a function applying it to new scores. Used to turn
+    the copula-fused rank score into a probability for calibration assessment."""
+    y_ref = np.asarray(y_ref, float); s_ref = np.asarray(s_ref, float).reshape(-1, 1)
+    lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000)
+    lr.fit(s_ref, y_ref)
+    return lambda s: lr.predict_proba(np.asarray(s, float).reshape(-1, 1))[:, 1]
+
+
+def calibration_table(scores_dict, y, tag):
+    y = np.asarray(y, float)
+    rows = []
+    for name, p in scores_dict.items():
+        p = np.asarray(p, float)
+        hl = hosmer_lemeshow(y, p)
+        si = calibration_slope_intercept(y, p)
+        rows.append({'cohort': tag, 'score': name,
+                     'brier': float(np.mean((p - y) ** 2)),
+                     'hl_chi2': hl['chi2'], 'hl_dof': hl['dof'],
+                     'hl_p_value': hl['p_value'],
+                     'calibration_slope': si['slope'],
+                     'calibration_intercept': si['intercept'],
+                     'ici': integrated_calibration_index(y, p)})
+        print(f"  [{tag}:{name}] Brier={rows[-1]['brier']:.4f}  "
+              f"HL p={hl['p_value']:.3f}  slope={si['slope']:.3f}  "
+              f"intercept={si['intercept']:.3f}  ICI={rows[-1]['ici']:.4f}")
+    return rows
+
+
+def plot_calibration(scores_dict, y, savepath, title):
+    if not HAS_PLOT:
+        return
+    from sklearn.calibration import calibration_curve
+    y = np.asarray(y, float)
+    plt.figure(figsize=(6, 6))
+    plt.plot([0, 1], [0, 1], 'k--', alpha=0.6, label='Perfect calibration')
+    for name, p in scores_dict.items():
+        p = np.asarray(p, float)
+        nb = min(10, max(3, int(len(np.unique(p)) // 2)))
+        frac_pos, mean_pred = calibration_curve(y, p, n_bins=nb, strategy='quantile')
+        hl = hosmer_lemeshow(y, p)
+        plt.plot(mean_pred, frac_pos, marker='o', label=f"{name} (HL p={hl['p_value']:.2f})")
+    plt.xlabel('Mean predicted risk'); plt.ylabel('Observed event fraction')
+    plt.title(title); plt.legend(loc='upper left')
+    plt.tight_layout(); plt.savefig(savepath, dpi=300); plt.close()
+
+
+# ============================================================
 # 6. MAIN
 # ============================================================
 def main():
@@ -560,6 +658,36 @@ def main():
     gene_auc, gene_lo, gene_hi = bootstrap_auc_ci(y_tcga, gene_test_prob, seed=RANDOM_STATE)
     fused_auc, fused_lo, fused_hi = bootstrap_auc_ci(y_tcga, fused_test, seed=RANDOM_STATE)
 
+    # ---- Simple fusion baselines in TCGA (is the copula needed externally?) ----
+    # Rank-average and probability-average require no training; the logistic
+    # stacker is trained on the METABRIC out-of-fold scores and applied unchanged
+    # to TCGA, exactly like the base models and the copula.
+    rank_avg_test = (u_test + v_test) / 2.0
+    prob_avg_test = (clin_test_prob + gene_test_prob) / 2.0
+    stacker = LogisticRegression(max_iter=1000).fit(
+        np.column_stack([clin_oof, gene_oof]), y_met)
+    stack_test = stacker.predict_proba(
+        np.column_stack([clin_test_prob, gene_test_prob]))[:, 1]
+
+    ext_baselines = {
+        'clinical': clin_test_prob,
+        'gene-expression': gene_test_prob,
+        'copula-fused': fused_test,
+        'rank-average': rank_avg_test,
+        'probability-average': prob_avg_test,
+        'logistic-stacking': stack_test,
+    }
+    print('\n' + '=' * 60)
+    print('FUSION BASELINES IN TCGA (copula vs simple fusion)')
+    print('=' * 60)
+    baseline_rows = []
+    for name, s in ext_baselines.items():
+        a, lo, hi = bootstrap_auc_ci(y_tcga, s, seed=RANDOM_STATE)
+        baseline_rows.append({'score': name, 'external_auc': a,
+                              'ci_lo': lo, 'ci_hi': hi})
+        print(f"  {name:22s} AUC = {a:.4f} [{lo:.4f}, {hi:.4f}]")
+    pd.DataFrame(baseline_rows).to_csv(OUTDIR / 'fusion_baselines_tcga.csv', index=False)
+
     summary = {
         'metabric_n_after_endpoint_filter': int(len(met)),
         'tcga_n_after_endpoint_filter': int(len(tcga)),
@@ -615,6 +743,35 @@ def main():
 
     if HAS_PLOT:
         plot_roc(y_tcga, [clin_test_prob, gene_test_prob, fused_test], ['Clinical', 'Gene-expression', 'Copula-fused'], OUTDIR / 'external_validation_roc.png')
+
+    # ---- Calibration assessment (Editor point 1) ----
+    # Clinical and gene scores are genuine predicted probabilities.
+    # The copula-fused score is a rank-based joint-risk score; we recalibrate it
+    # to a probability using a logistic map fitted on the METABRIC internal data,
+    # then assess its calibration internally and (out-of-sample) in TCGA.
+    print('\n' + '=' * 60)
+    print('CALIBRATION ASSESSMENT (5-year overall survival)')
+    print('=' * 60)
+    fused_map = recalibrate_map(y_met, fused_train)
+    fused_train_prob = fused_map(fused_train)
+    fused_test_prob = fused_map(fused_test)
+
+    internal_scores = {'clinical': clin_oof, 'gene-expression': gene_oof,
+                       'copula-fused (recalibrated)': fused_train_prob}
+    external_scores = {'clinical': clin_test_prob, 'gene-expression': gene_test_prob,
+                       'copula-fused (recalibrated)': fused_test_prob}
+
+    calib_rows = []
+    calib_rows += calibration_table(internal_scores, y_met, 'METABRIC (internal)')
+    calib_rows += calibration_table(external_scores, y_tcga, 'TCGA (external)')
+    pd.DataFrame(calib_rows).to_csv(OUTDIR / 'calibration_summary.csv', index=False)
+
+    plot_calibration(internal_scores, y_met,
+                     OUTDIR / 'calibration_metabric_internal.png',
+                     'Calibration — METABRIC internal (5-yr overall survival)')
+    plot_calibration(external_scores, y_tcga,
+                     OUTDIR / 'calibration_tcga_external.png',
+                     'Calibration — TCGA external (5-yr overall survival)')
 
     print('Done.')
     print(json.dumps(summary, indent=2))
