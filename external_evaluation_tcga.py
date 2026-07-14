@@ -1,4 +1,4 @@
-#For TCGA
+# Harmonized METABRIC-to-TCGA external evaluation
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -27,6 +27,53 @@ try:
 except Exception:
     HAS_XGB = False
 
+
+# ============================================================
+# GPU CONFIG (Colab-ready). Auto-detects an NVIDIA GPU and routes
+# XGBoost to CUDA. Set USE_GPU_XGB = False to force CPU if needed.
+# Only XGBoost is GPU-accelerated; RandomForest / GradientBoosting /
+# permutation importance run multi-core on CPU via n_jobs=-1.
+# ============================================================
+USE_GPU_XGB = True
+import shutil as _shutil, subprocess as _subprocess
+def _detect_gpu():
+    if not USE_GPU_XGB or _shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        return _subprocess.run(["nvidia-smi"],
+                               stdout=_subprocess.DEVNULL,
+                               stderr=_subprocess.DEVNULL).returncode == 0
+    except Exception:
+        return False
+_USE_GPU = _detect_gpu()
+_XGB_KW = {"tree_method": "hist", "device": "cuda"} if _USE_GPU else {"tree_method": "hist"}
+print(f"[config] XGBoost device: {'cuda (GPU)' if _USE_GPU else 'cpu (hist)'}")
+STRICT_INPUT_CHECKS = True  # hard-stop guards against truncated / wrong input data
+
+
+def _pkg_versions():
+    import sklearn, scipy
+    v = {"numpy": np.__version__, "pandas": pd.__version__,
+         "scipy": scipy.__version__, "sklearn": sklearn.__version__}
+    try:
+        import xgboost; v["xgboost"] = xgboost.__version__
+    except Exception:
+        v["xgboost"] = "not installed"
+    try:
+        import lifelines; v["lifelines"] = lifelines.__version__
+    except Exception:
+        v["lifelines"] = "not installed"
+    return v
+
+
+def xgb_actual_device(pipe):
+    """Read the device the XGBoost booster actually trained on (config JSON)."""
+    try:
+        clf = pipe.named_steps.get("clf")
+        cfg = json.loads(clf.get_booster().save_config())
+        return cfg.get("learner", {}).get("generic_param", {}).get("device", "unknown")
+    except Exception as e:
+        return f"unknown ({e})"
 try:
     import matplotlib
     matplotlib.use('Agg')
@@ -37,13 +84,19 @@ except Exception:
 
 RANDOM_STATE = 42
 EPS = 1e-10
+METABRIC_DEAD_VALUE = 0
+TCGA_DEAD_VALUE = 1
+
+# This analysis evaluates a harmonized model specification. It is not a direct
+# external validation of the richer primary METABRIC model because the endpoint,
+# predictor set, and expression platform differ between cohorts.
 
 # ============================================================
 # 1. INPUT PATHS
 # ============================================================
 METABRIC_PATH = 'METABRIC_RNA_Mutation.csv'
 TCGA_PATH = 'tcga_final_dataset.csv'
-OUTDIR = Path('harmonized_external_validation_outputs')
+OUTDIR = Path('harmonized_external_evaluation_outputs')
 
 # ============================================================
 # 2. HELPERS
@@ -56,6 +109,120 @@ def clean_names(x: str) -> str:
     while '__' in x:
         x = x.replace('__', '_')
     return x
+
+
+KNOWN_NON_GENE_COLUMNS = {
+    'PATIENT_ID', 'AGE_AT_DIAGNOSIS', 'TYPE_OF_BREAST_SURGERY',
+    'CANCER_TYPE', 'CANCER_TYPE_DETAILED', 'CELLULARITY', 'CHEMOTHERAPY',
+    'PAM50___CLAUDIN_LOW_SUBTYPE', 'COHORT', 'ER_STATUS_MEASURED_BY_IHC',
+    'ER_STATUS', 'NEOPLASM_HISTOLOGIC_GRADE', 'HER2_STATUS_MEASURED_BY_SNP6',
+    'HER2_STATUS', 'TUMOR_OTHER_HISTOLOGIC_SUBTYPE', 'HORMONE_THERAPY',
+    'INFERRED_MENOPAUSAL_STATE', 'INTEGRATIVE_CLUSTER',
+    'PRIMARY_TUMOR_LATERALITY', 'LYMPH_NODES_EXAMINED_POSITIVE',
+    'MUTATION_COUNT', 'NOTTINGHAM_PROGNOSTIC_INDEX', 'ONCOTREE_CODE',
+    'OVERALL_SURVIVAL_MONTHS', 'OVERALL_SURVIVAL', 'PR_STATUS',
+    'RADIO_THERAPY', 'X3_GENE_CLASSIFIER_SUBTYPE', 'TUMOR_SIZE',
+    'TUMOR_STAGE', 'DEATH_FROM_CANCER', 'LYMPH_NODES', 'METASTASIS_STAGE',
+    'SUBTYPE', 'RACE', 'RADIATION_THERAPY', 'SEX', 'GENDER', 'VITAL_STATUS'
+}
+
+
+def validate_binary_status(df, dataset_name, status_col, dead_value):
+    """Fail loudly when the assumed binary endpoint coding is not present."""
+    if status_col not in df.columns:
+        raise ValueError(f'{dataset_name} is missing required status column: {status_col}')
+
+    status = pd.to_numeric(df[status_col], errors='coerce')
+    observed = set(status.dropna().unique())
+    if not observed.issubset({0, 1}):
+        raise ValueError(
+            f'{dataset_name} {status_col} contains unexpected values: {sorted(observed)}'
+        )
+    if dead_value not in observed:
+        raise ValueError(
+            f'Configured death value {dead_value} is absent from {dataset_name} {status_col}'
+        )
+
+    print('\n' + '=' * 60)
+    print(f'{dataset_name} endpoint coding check')
+    print('=' * 60)
+    print(status.value_counts(dropna=False).sort_index())
+    print(f'Configured death value: {dead_value}')
+    return status
+
+
+def validate_metabric_status_consistency(df, minimum_agreement=0.95):
+    """Cross-check METABRIC overall-survival coding against cause-of-death text."""
+    required = {'OVERALL_SURVIVAL', 'DEATH_FROM_CANCER'}
+    if not required.issubset(df.columns):
+        print('METABRIC cause-of-death text is unavailable; cross-check skipped.')
+        return np.nan
+
+    overall = pd.to_numeric(df['OVERALL_SURVIVAL'], errors='coerce')
+    cause = df['DEATH_FROM_CANCER'].astype(str).str.strip().str.lower()
+    informative = cause.isin({'died of disease', 'living'}) & overall.notna()
+    if informative.sum() == 0:
+        print('No informative METABRIC records were available for coding cross-check.')
+        return np.nan
+
+    expected_dead = cause.loc[informative].eq('died of disease').astype(int).to_numpy()
+    coded_dead = overall.loc[informative].eq(METABRIC_DEAD_VALUE).astype(int).to_numpy()
+    agreement = float(np.mean(expected_dead == coded_dead))
+
+    print('\nMETABRIC survival-status cross-tabulation:')
+    print(pd.crosstab(overall, cause, dropna=False))
+    print(f'Agreement with configured death coding: {agreement:.4f}')
+    if agreement < minimum_agreement:
+        raise ValueError(
+            'METABRIC endpoint coding failed the cause-of-death cross-check. '
+            'Do not run the analysis until the coding is verified.'
+        )
+    return agreement
+
+
+def expression_shift_audit(train_df, test_df, genes, outdir):
+    """Quantify cross-platform distribution shift without using outcome labels."""
+    rows = []
+    for gene in genes:
+        a = pd.to_numeric(train_df[gene], errors='coerce')
+        b = pd.to_numeric(test_df[gene], errors='coerce')
+        mean_a, mean_b = a.mean(), b.mean()
+        sd_a, sd_b = a.std(ddof=1), b.std(ddof=1)
+        pooled = np.sqrt((sd_a ** 2 + sd_b ** 2) / 2.0) if np.isfinite(sd_a) and np.isfinite(sd_b) else np.nan
+        smd = (mean_b - mean_a) / pooled if np.isfinite(pooled) and pooled > 0 else np.nan
+        iqr_a = a.quantile(0.75) - a.quantile(0.25)
+        iqr_b = b.quantile(0.75) - b.quantile(0.25)
+        rows.append({
+            'gene': gene,
+            'metabric_mean': mean_a,
+            'metabric_sd': sd_a,
+            'metabric_median': a.median(),
+            'metabric_iqr': iqr_a,
+            'metabric_missing_fraction': a.isna().mean(),
+            'tcga_mean': mean_b,
+            'tcga_sd': sd_b,
+            'tcga_median': b.median(),
+            'tcga_iqr': iqr_b,
+            'tcga_missing_fraction': b.isna().mean(),
+            'standardized_mean_difference': smd,
+            'absolute_standardized_mean_difference': abs(smd) if np.isfinite(smd) else np.nan,
+        })
+    audit = pd.DataFrame(rows).sort_values(
+        'absolute_standardized_mean_difference', ascending=False, na_position='last'
+    )
+    audit.to_csv(outdir / 'expression_platform_shift_audit.csv', index=False)
+    finite = audit['absolute_standardized_mean_difference'].dropna()
+    summary = {
+        'n_shared_genes': int(len(genes)),
+        'median_absolute_smd': float(finite.median()) if len(finite) else None,
+        'fraction_absolute_smd_gt_0_5': float((finite > 0.5).mean()) if len(finite) else None,
+        'fraction_absolute_smd_gt_1': float((finite > 1.0).mean()) if len(finite) else None,
+    }
+    with open(outdir / 'expression_platform_shift_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+    print('\nExpression-platform shift audit:')
+    print(json.dumps(summary, indent=2))
+    return audit, summary
 
 
 def _one_hot_encoder():
@@ -120,7 +287,8 @@ def fit_and_oof(X, y, num_cols, cat_cols, random_state=42):
         )),
     ]
     if HAS_XGB:
-        models.append(('xgboost', XGBClassifier(
+        models.append(('xgboost', XGBClassifier(**_XGB_KW,
+            
             n_estimators=500, learning_rate=0.05, max_depth=3,
             subsample=0.8, colsample_bytree=0.8,
             objective='binary:logistic', eval_metric='logloss',
@@ -137,7 +305,8 @@ def fit_and_oof(X, y, num_cols, cat_cols, random_state=42):
 
     for name, clf in models:
         pipe = Pipeline([('pre', pre), ('clf', clf)])
-        oof = cross_val_predict(pipe, X, y, cv=skf, method='predict_proba', n_jobs=-1)[:, 1]
+        cv_njobs = 1 if (name == 'xgboost' and _USE_GPU) else -1
+        oof = cross_val_predict(pipe, X, y, cv=skf, method='predict_proba', n_jobs=cv_njobs)[:, 1]
         auc_val = roc_auc_score(y, oof)
         all_metrics.append({'model': name, 'cv_auc': auc_val})
         if auc_val > best_auc:
@@ -357,6 +526,9 @@ def _harmonize_tumor_stage(series):
 
 def load_metabric_harmonized(path):
     df = pd.read_csv(path, low_memory=False)
+    if STRICT_INPUT_CHECKS:
+        assert df.shape == (1904, 693), (
+            f"METABRIC shape {df.shape} != (1904, 693); input truncated or wrong.")
     df.columns = [clean_names(c) for c in df.columns]
     if 'TUMOR_STAGE' in df.columns:
         df['TUMOR_STAGE'] = _harmonize_tumor_stage(df['TUMOR_STAGE'])
@@ -367,6 +539,9 @@ def load_metabric_harmonized(path):
 
 def load_tcga_harmonized(path):
     df = pd.read_csv(path, low_memory=False)
+    if STRICT_INPUT_CHECKS:
+        assert df.shape == (981, 488), (
+            f"TCGA shape {df.shape} != (981, 488); input truncated or wrong.")
     df.columns = [clean_names(c) for c in df.columns]
     if 'TUMOR_STAGE' in df.columns:
         df['TUMOR_STAGE'] = _harmonize_tumor_stage(df['TUMOR_STAGE'])
@@ -376,62 +551,70 @@ def load_tcga_harmonized(path):
 
 
 def build_metabric_5y_overall(df, cutoff_months=60.0):
-    if 'OVERALL_SURVIVAL' not in df.columns or 'OVERALL_SURVIVAL_MONTHS' not in df.columns:
-        raise ValueError('METABRIC missing OVERALL_SURVIVAL or OVERALL_SURVIVAL_MONTHS')
+    required = {'OVERALL_SURVIVAL', 'OVERALL_SURVIVAL_MONTHS'}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f'METABRIC is missing required columns: {sorted(missing)}')
 
     time = pd.to_numeric(df['OVERALL_SURVIVAL_MONTHS'], errors='coerce')
     raw = pd.to_numeric(df['OVERALL_SURVIVAL'], errors='coerce')
-    # METABRIC Kaggle convention used in your pipeline: 0=dead, 1=alive
-    dead = (raw == 0).astype(float)
+    dead = raw.eq(METABRIC_DEAD_VALUE).astype(float)
 
     y = pd.Series(np.nan, index=df.index, dtype=float)
     y.loc[(dead == 1) & (time <= cutoff_months)] = 1.0
-    y.loc[((dead == 1) & (time > cutoff_months)) | ((dead == 0) & (time >= cutoff_months))] = 0.0
+    y.loc[((dead == 1) & (time > cutoff_months)) |
+          ((dead == 0) & (time >= cutoff_months))] = 0.0
+    print(
+        f'METABRIC 5-year overall mortality: {(y == 1).sum()} events, '
+        f'{(y == 0).sum()} non-events, {y.isna().sum()} excluded'
+    )
     return y
 
 
 def build_tcga_5y_overall(df, cutoff_months=60.0):
-    if 'OVERALL_SURVIVAL' not in df.columns or 'OVERALL_SURVIVAL_MONTHS' not in df.columns:
-        raise ValueError('TCGA missing OVERALL_SURVIVAL or OVERALL_SURVIVAL_MONTHS')
+    required = {'OVERALL_SURVIVAL', 'OVERALL_SURVIVAL_MONTHS'}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f'TCGA is missing required columns: {sorted(missing)}')
 
     time = pd.to_numeric(df['OVERALL_SURVIVAL_MONTHS'], errors='coerce')
     raw = pd.to_numeric(df['OVERALL_SURVIVAL'], errors='coerce')
-  
-    dead = (raw == 1).astype(float)
+    dead = raw.eq(TCGA_DEAD_VALUE).astype(float)
 
     y = pd.Series(np.nan, index=df.index, dtype=float)
     y.loc[(dead == 1) & (time <= cutoff_months)] = 1.0
-    y.loc[((dead == 1) & (time > cutoff_months)) | ((dead == 0) & (time >= cutoff_months))] = 0.0
+    y.loc[((dead == 1) & (time > cutoff_months)) |
+          ((dead == 0) & (time >= cutoff_months))] = 0.0
+    print(
+        f'TCGA 5-year overall mortality: {(y == 1).sum()} events, '
+        f'{(y == 0).sum()} non-events, {y.isna().sum()} excluded'
+    )
     return y
 
 
 def get_common_genes_and_clinical(metabric, tcga):
     clinical_candidates = ['AGE_AT_DIAGNOSIS', 'TUMOR_STAGE']
-    shared_clinical = [c for c in clinical_candidates if c in metabric.columns and c in tcga.columns]
+    shared_clinical = [
+        c for c in clinical_candidates
+        if c in metabric.columns and c in tcga.columns
+    ]
 
-    met_exclude = {
-        'PATIENT_ID', 'OVERALL_SURVIVAL_MONTHS', 'OVERALL_SURVIVAL', 'DEATH_FROM_CANCER'
-    }
-    tcga_exclude = {
-        'PATIENT_ID', 'OVERALL_SURVIVAL_MONTHS', 'OVERALL_SURVIVAL', 'DEATH_FROM_CANCER',
-        'LYMPH_NODES', 'METASTASIS_STAGE', 'SUBTYPE', 'RACE', 'RADIATION_THERAPY'
-    }
-
-    met_gene_cols = [
+    met_gene_cols = {
         c for c in metabric.columns
-        if c not in met_exclude
-        and c not in shared_clinical
+        if c not in KNOWN_NON_GENE_COLUMNS
         and not c.endswith('_MUT')
         and pd.api.types.is_numeric_dtype(metabric[c])
-    ]
-    tcga_gene_cols = [
+        and pd.to_numeric(metabric[c], errors='coerce').nunique(dropna=True) > 1
+    }
+    tcga_gene_cols = {
         c for c in tcga.columns
-        if c not in tcga_exclude
-        and c not in shared_clinical
+        if c not in KNOWN_NON_GENE_COLUMNS
+        and not c.endswith('_MUT')
         and pd.api.types.is_numeric_dtype(tcga[c])
-    ]
+        and pd.to_numeric(tcga[c], errors='coerce').nunique(dropna=True) > 1
+    }
 
-    common_genes = sorted(set(met_gene_cols).intersection(tcga_gene_cols))
+    common_genes = sorted(met_gene_cols.intersection(tcga_gene_cols))
     return shared_clinical, common_genes
 
 # ============================================================
@@ -447,7 +630,7 @@ def plot_roc(y_true, scores, labels, savepath):
     plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
     plt.xlabel('False positive rate')
     plt.ylabel('True positive rate')
-    plt.title('External validation ROC curves')
+    plt.title('Independent TCGA external evaluation ROC curves')
     plt.legend(loc='lower right')
     plt.tight_layout()
     plt.savefig(savepath, dpi=300)
@@ -478,39 +661,98 @@ def hosmer_lemeshow(y, p, g=10):
             'p_value': float(stats.chi2.sf(chi2, dof)), 'n_bins': used}
 
 
+def _fit_unpenalized_logistic(X, y):
+    """Support both current and older scikit-learn penalty syntax."""
+    last_error = None
+    for penalty in (None, 'none'):
+        try:
+            model = LogisticRegression(
+                penalty=penalty, solver='lbfgs', max_iter=5000
+            )
+            model.fit(X, y)
+            return model
+        except (TypeError, ValueError) as exc:
+            last_error = exc
+    raise RuntimeError('Unable to fit unpenalized logistic regression.') from last_error
+
+
+def safe_logit(p, eps=1e-6):
+    p = np.clip(np.asarray(p, dtype=float), eps, 1.0 - eps)
+    return np.log(p / (1.0 - p))
+
+
+def _calibration_predictor(score, score_type):
+    score = np.asarray(score, dtype=float)
+    if score_type == 'probability':
+        score = safe_logit(score)
+    elif score_type != 'continuous':
+        raise ValueError("score_type must be 'probability' or 'continuous'")
+    return score.reshape(-1, 1)
+
+
+def fit_recalibration_model(y, score, score_type):
+    return _fit_unpenalized_logistic(
+        _calibration_predictor(score, score_type), np.asarray(y, dtype=int)
+    )
+
+
+def apply_recalibration_model(model, score, score_type):
+    X = _calibration_predictor(score, score_type)
+    return model.predict_proba(X)[:, 1]
+
+
+def cross_fitted_recalibration(y, score, score_type, n_splits=5, random_state=42):
+    """Second-stage cross-fitted recalibration of out-of-fold scores plus a final transport map."""
+    y = np.asarray(y, dtype=int)
+    score = np.asarray(score, dtype=float)
+    if len(y) != len(score) or np.isnan(score).any():
+        raise ValueError('Invalid score vector supplied for recalibration.')
+
+    splitter = StratifiedKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
+    calibrated_oof = np.full(len(y), np.nan, dtype=float)
+    for train_idx, test_idx in splitter.split(np.zeros(len(y)), y):
+        model = fit_recalibration_model(
+            y[train_idx], score[train_idx], score_type
+        )
+        calibrated_oof[test_idx] = apply_recalibration_model(
+            model, score[test_idx], score_type
+        )
+    if np.isnan(calibrated_oof).any():
+        raise RuntimeError('Cross-fitted recalibration produced missing predictions.')
+
+    final_model = fit_recalibration_model(y, score, score_type)
+    return calibrated_oof, final_model
+
+
 def calibration_slope_intercept(y, p, eps=1e-6):
-    y = np.asarray(y, float); p = np.clip(np.asarray(p, float), eps, 1 - eps)
-    logit = np.log(p / (1 - p)).reshape(-1, 1)
-    lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000)
-    lr.fit(logit, y)
-    slope = float(lr.coef_[0, 0])
-    a = 0.0
+    y = np.asarray(y, dtype=int)
+    p = np.clip(np.asarray(p, dtype=float), eps, 1.0 - eps)
+    logit_p = safe_logit(p, eps=eps).reshape(-1, 1)
+    slope_model = _fit_unpenalized_logistic(logit_p, y)
+    slope = float(slope_model.coef_[0, 0])
+
+    intercept = 0.0
     for _ in range(100):
-        mu = 1 / (1 + np.exp(-(a + logit.ravel())))
-        grad = np.sum(y - mu); hess = -np.sum(mu * (1 - mu))
-        if abs(hess) < 1e-12:
+        mu = 1.0 / (1.0 + np.exp(-(intercept + logit_p.ravel())))
+        gradient = np.sum(y - mu)
+        hessian = -np.sum(mu * (1.0 - mu))
+        if abs(hessian) < 1e-12:
             break
-        step = grad / hess; a -= step
+        step = gradient / hessian
+        intercept -= step
         if abs(step) < 1e-10:
             break
-    return {'slope': slope, 'intercept': float(a)}
+    return {'slope': slope, 'intercept': float(intercept)}
 
 
 def integrated_calibration_index(y, p):
     from sklearn.isotonic import IsotonicRegression
-    y = np.asarray(y, float); p = np.asarray(p, float)
-    obs = IsotonicRegression(out_of_bounds='clip').fit_transform(p, y)
-    return float(np.mean(np.abs(obs - p)))
-
-
-def recalibrate_map(y_ref, s_ref):
-    """Fit a logistic recalibration map prob = sigmoid(a + b*s) on reference
-    (internal) data; return a function applying it to new scores. Used to turn
-    the copula-fused rank score into a probability for calibration assessment."""
-    y_ref = np.asarray(y_ref, float); s_ref = np.asarray(s_ref, float).reshape(-1, 1)
-    lr = LogisticRegression(penalty=None, solver='lbfgs', max_iter=1000)
-    lr.fit(s_ref, y_ref)
-    return lambda s: lr.predict_proba(np.asarray(s, float).reshape(-1, 1))[:, 1]
+    y = np.asarray(y, float)
+    p = np.asarray(p, float)
+    observed = IsotonicRegression(out_of_bounds='clip').fit_transform(p, y)
+    return float(np.mean(np.abs(observed - p)))
 
 
 def calibration_table(scores_dict, y, tag):
@@ -533,6 +775,14 @@ def calibration_table(scores_dict, y, tag):
     return rows
 
 
+def format_p(p):
+    if p < 0.001:
+        return "p<0.001"
+    if p < 0.01:
+        return f"p={p:.3f}"
+    return f"p={p:.2f}"
+
+
 def plot_calibration(scores_dict, y, savepath, title):
     if not HAS_PLOT:
         return
@@ -545,7 +795,7 @@ def plot_calibration(scores_dict, y, savepath, title):
         nb = min(10, max(3, int(len(np.unique(p)) // 2)))
         frac_pos, mean_pred = calibration_curve(y, p, n_bins=nb, strategy='quantile')
         hl = hosmer_lemeshow(y, p)
-        plt.plot(mean_pred, frac_pos, marker='o', label=f"{name} (HL p={hl['p_value']:.2f})")
+        plt.plot(mean_pred, frac_pos, marker='o', label=f"{name} (HL {format_p(hl['p_value'])})")
     plt.xlabel('Mean predicted risk'); plt.ylabel('Observed event fraction')
     plt.title(title); plt.legend(loc='upper left')
     plt.tight_layout(); plt.savefig(savepath, dpi=300); plt.close()
@@ -560,8 +810,23 @@ def main():
     met = load_metabric_harmonized(METABRIC_PATH)
     tcga = load_tcga_harmonized(TCGA_PATH)
 
+    validate_binary_status(
+        met, 'METABRIC', 'OVERALL_SURVIVAL', METABRIC_DEAD_VALUE
+    )
+    metabric_status_agreement = validate_metabric_status_consistency(met)
+    validate_binary_status(
+        tcga, 'TCGA', 'OVERALL_SURVIVAL', TCGA_DEAD_VALUE
+    )
+
     y_met = build_metabric_5y_overall(met)
     y_tcga = build_tcga_5y_overall(tcga)
+    if STRICT_INPUT_CHECKS:
+        _e = int((y_met == 1).sum()); _n = int((y_met == 0).sum()); _x = int(y_met.isna().sum())
+        assert (_e, _n, _x) == (412, 1432, 60), (
+            f"METABRIC 5y overall endpoint {(_e, _n, _x)} != (412, 1432, 60).")
+        _e = int((y_tcga == 1).sum()); _n = int((y_tcga == 0).sum()); _x = int(y_tcga.isna().sum())
+        assert (_e, _n, _x) == (85, 232, 664), (
+            f"TCGA 5y overall endpoint {(_e, _n, _x)} != (85, 232, 664).")
 
     met = met.loc[~y_met.isna()].reset_index(drop=True)
     y_met = y_met.loc[~y_met.isna()].astype(int).reset_index(drop=True)
@@ -570,6 +835,9 @@ def main():
     y_tcga = y_tcga.loc[~y_tcga.isna()].astype(int).reset_index(drop=True)
 
     shared_clinical, common_genes = get_common_genes_and_clinical(met, tcga)
+    if STRICT_INPUT_CHECKS:
+        assert len(common_genes) == 476, (
+            f"Shared gene count {len(common_genes)} != 476; input may be wrong.")
 
     if len(shared_clinical) == 0:
         raise ValueError('No shared clinical predictors found.')
@@ -580,6 +848,28 @@ def main():
     clinical_test = tcga[shared_clinical].copy()
     gene_train = met[common_genes].copy()
     gene_test = tcga[common_genes].copy()
+
+    pd.DataFrame({'shared_gene': common_genes}).to_csv(
+        OUTDIR / 'shared_gene_manifest.csv', index=False
+    )
+    expression_audit, expression_shift_summary = expression_shift_audit(
+        gene_train, gene_test, common_genes, OUTDIR
+    )
+    with open(OUTDIR / 'harmonization_manifest.json', 'w') as f:
+        json.dump({
+            'analysis_label': 'independent external evaluation of a harmonized specification',
+            'shared_clinical_predictors': shared_clinical,
+            'n_shared_genes': len(common_genes),
+            'metabric_endpoint': '5-year overall mortality',
+            'tcga_endpoint': '5-year overall mortality',
+            'primary_metabric_model_directly_validated': False,
+            'reason_not_direct_validation': [
+                'different endpoint from the primary cancer-specific analysis',
+                'reduced shared clinical predictor set',
+                'reduced shared gene set',
+                'microarray versus RNA-seq platform mismatch'
+            ]
+        }, f, indent=2)
 
     for c in shared_clinical:
         if c == 'AGE_AT_DIAGNOSIS':
@@ -606,6 +896,18 @@ def main():
     )
     gene_test_prob = gene_pipe.predict_proba(gene_test)[:, 1]
 
+    # ---- Verify actual XGBoost device + record environment (Phoenix point 7) ----
+    _xgb_device_used = None
+    for _nm, _pipe in [(clin_name, clin_pipe), (gene_name, gene_pipe)]:
+        if _nm == 'xgboost':
+            _xgb_device_used = xgb_actual_device(_pipe)
+            print(f"  [device check] XGBoost booster trained on: {_xgb_device_used}")
+    with open(OUTDIR / 'run_environment.json', 'w') as _f:
+        json.dump({'xgboost_config_device': ('cuda' if _USE_GPU else 'cpu'),
+                   'xgboost_actual_booster_device': _xgb_device_used,
+                   'package_versions': _pkg_versions(), 'seed': RANDOM_STATE,
+                   'strict_input_checks': STRICT_INPUT_CHECKS}, _f, indent=2)
+
     # Internal METABRIC CV AUCs with bootstrap CIs
     clin_cv_auc, clin_cv_lo, clin_cv_hi = bootstrap_auc_ci(y_met, clin_oof, seed=RANDOM_STATE)
     gene_cv_auc, gene_cv_lo, gene_cv_hi = bootstrap_auc_ci(y_met, gene_oof, seed=RANDOM_STATE)
@@ -623,7 +925,8 @@ def main():
 
     copula_rows = []
     best_name = None
-    best_p = -1
+    best_cvm = np.inf
+    best_gof_p = np.nan
     best_param = None
     best_cdf = None
 
@@ -639,8 +942,9 @@ def main():
             'lambda_L': lamL,
             'lambda_U': lamU,
         })
-        if pval > best_p:
-            best_p = pval
+        if cvm < best_cvm:
+            best_cvm = cvm
+            best_gof_p = pval
             best_name = name
             best_param = param
             best_cdf = spec['cdf']
@@ -698,8 +1002,17 @@ def main():
         'n_shared_genes': int(len(common_genes)),
         'best_clinical_model': clin_name,
         'best_gene_model': gene_name,
-        'best_copula': best_name,
-        'best_copula_param': float(best_param),
+        'selected_copula': best_name,
+        'selected_copula_param': float(best_param),
+        'copula_selection_criterion': 'minimum Cramer-von Mises statistic',
+        'selected_copula_cvm': float(best_cvm),
+        'selected_copula_gof_p_value': float(best_gof_p),
+        'metabric_status_coding_agreement': (
+            None if np.isnan(metabric_status_agreement)
+            else float(metabric_status_agreement)
+        ),
+        'external_analysis_label': 'independent external evaluation of harmonized specification',
+        'expression_shift_summary': expression_shift_summary,
         'external_auc_clinical': float(clin_auc),
         'external_auc_gene': float(gene_auc),
         'external_auc_fused': float(fused_auc),
@@ -738,40 +1051,93 @@ def main():
         'v_test': v_test,
     }).to_csv(OUTDIR / 'tcga_external_scores.csv', index=False)
 
+    if HAS_PLOT:
+        plot_roc(
+            y_tcga,
+            [clin_test_prob, gene_test_prob, fused_test],
+            ['Clinical', 'Gene-expression', 'Copula-fused'],
+            OUTDIR / 'external_evaluation_roc.png'
+        )
+
+    # Fair calibration comparison. Every score receives the same treatment:
+    # cross-fitted recalibration internally, then a final METABRIC map transported
+    # unchanged to TCGA.
+    print('\n' + '=' * 60)
+    print('CALIBRATION ASSESSMENT: 5-YEAR OVERALL MORTALITY')
+    print('=' * 60)
+
+    clinical_cal_oof, clinical_cal_model = cross_fitted_recalibration(
+        y_met, clin_oof, 'probability', random_state=RANDOM_STATE
+    )
+    gene_cal_oof, gene_cal_model = cross_fitted_recalibration(
+        y_met, gene_oof, 'probability', random_state=RANDOM_STATE
+    )
+    fused_cal_oof, fused_cal_model = cross_fitted_recalibration(
+        y_met, fused_train, 'continuous', random_state=RANDOM_STATE
+    )
+
+    clinical_cal_tcga = apply_recalibration_model(
+        clinical_cal_model, clin_test_prob, 'probability'
+    )
+    gene_cal_tcga = apply_recalibration_model(
+        gene_cal_model, gene_test_prob, 'probability'
+    )
+    fused_cal_tcga = apply_recalibration_model(
+        fused_cal_model, fused_test, 'continuous'
+    )
+
+    internal_scores = {
+        'clinical recalibrated': clinical_cal_oof,
+        'gene-expression recalibrated': gene_cal_oof,
+        'copula-fused recalibrated': fused_cal_oof,
+    }
+    external_scores = {
+        'clinical recalibrated': clinical_cal_tcga,
+        'gene-expression recalibrated': gene_cal_tcga,
+        'copula-fused recalibrated': fused_cal_tcga,
+    }
+
+    calibration_rows = []
+    calibration_rows += calibration_table(
+        internal_scores, y_met, 'METABRIC internal cross-fitted'
+    )
+    calibration_rows += calibration_table(
+        external_scores, y_tcga, 'TCGA external evaluation'
+    )
+    calibration_df = pd.DataFrame(calibration_rows)
+    calibration_df.to_csv(OUTDIR / 'calibration_summary.csv', index=False)
+
+    plot_calibration(
+        internal_scores, y_met,
+        OUTDIR / 'calibration_metabric_internal_cross_fitted.png',
+        'Cross-fitted calibration in METABRIC (5-year overall mortality)'
+    )
+    plot_calibration(
+        external_scores, y_tcga,
+        OUTDIR / 'calibration_tcga_external_evaluation.png',
+        'External calibration in TCGA (5-year overall mortality)'
+    )
+
+    pd.DataFrame({
+        'patient_id': (
+            tcga['PATIENT_ID'] if 'PATIENT_ID' in tcga.columns
+            else np.arange(len(tcga))
+        ),
+        'y_5y_overall': y_tcga,
+        'clinical_raw_probability': clin_test_prob,
+        'gene_raw_probability': gene_test_prob,
+        'copula_raw_score': fused_test,
+        'clinical_calibrated_probability': clinical_cal_tcga,
+        'gene_calibrated_probability': gene_cal_tcga,
+        'copula_calibrated_probability': fused_cal_tcga,
+    }).to_csv(OUTDIR / 'tcga_external_calibrated_scores.csv', index=False)
+
+    summary['calibration_file'] = 'calibration_summary.csv'
+    summary['calibration_interpretation_warning'] = (
+        'Calibration supports probability reliability. It does not establish clinical utility.'
+    )
     with open(OUTDIR / 'run_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-
-    if HAS_PLOT:
-        plot_roc(y_tcga, [clin_test_prob, gene_test_prob, fused_test], ['Clinical', 'Gene-expression', 'Copula-fused'], OUTDIR / 'external_validation_roc.png')
-
-    # ---- Calibration assessment (Editor point 1) ----
-    # Clinical and gene scores are genuine predicted probabilities.
-    # The copula-fused score is a rank-based joint-risk score; we recalibrate it
-    # to a probability using a logistic map fitted on the METABRIC internal data,
-    # then assess its calibration internally and (out-of-sample) in TCGA.
-    print('\n' + '=' * 60)
-    print('CALIBRATION ASSESSMENT (5-year overall survival)')
-    print('=' * 60)
-    fused_map = recalibrate_map(y_met, fused_train)
-    fused_train_prob = fused_map(fused_train)
-    fused_test_prob = fused_map(fused_test)
-
-    internal_scores = {'clinical': clin_oof, 'gene-expression': gene_oof,
-                       'copula-fused (recalibrated)': fused_train_prob}
-    external_scores = {'clinical': clin_test_prob, 'gene-expression': gene_test_prob,
-                       'copula-fused (recalibrated)': fused_test_prob}
-
-    calib_rows = []
-    calib_rows += calibration_table(internal_scores, y_met, 'METABRIC (internal)')
-    calib_rows += calibration_table(external_scores, y_tcga, 'TCGA (external)')
-    pd.DataFrame(calib_rows).to_csv(OUTDIR / 'calibration_summary.csv', index=False)
-
-    plot_calibration(internal_scores, y_met,
-                     OUTDIR / 'calibration_metabric_internal.png',
-                     'Calibration — METABRIC internal (5-yr overall survival)')
-    plot_calibration(external_scores, y_tcga,
-                     OUTDIR / 'calibration_tcga_external.png',
-                     'Calibration — TCGA external (5-yr overall survival)')
 
     print('Done.')
     print(json.dumps(summary, indent=2))
