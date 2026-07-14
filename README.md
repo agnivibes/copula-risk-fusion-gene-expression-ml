@@ -10,7 +10,7 @@
 
 This repository contains the complete, reproducible machine learning pipeline for our study on integrating multi-view biomedical data (clinical and gene-expression) using copula theory.
 
-We introduce a fusion framework that models the dependency structure between disparate risk scores using Gaussian, Clayton, Gumbel, and Frank copulas. We evaluate the nature of joint risk dependence in breast cancer patients using the METABRIC cohort (primary analysis) and validate the framework in an independent TCGA cohort (external validation).
+We introduce a fusion framework that models the dependency structure between disparate risk scores using Gaussian, Clayton, Gumbel, and Frank copulas. We evaluate the nature of joint risk dependence in breast cancer patients using the METABRIC cohort (primary analysis) and validate the framework in an independent TCGA cohort (external evaluation).
 
 All results, methodological details, and discussions are provided in our accompanying research paper. This repository focuses strictly on code and reproducibility.
 
@@ -31,9 +31,9 @@ This is a publicly available, pre-processed CSV file (`METABRIC_RNA_Mutation.csv
 
 Our analysis uses this processed file directly as provided on Kaggle. No additional preprocessing was applied to the source data prior to the steps described in our code and manuscript.
 
-### External Validation Dataset: TCGA
+### External evaluation Dataset: TCGA
 
-For external validation, we constructed an independent breast cancer dataset from The Cancer Genome Atlas (TCGA).
+For external evaluation, we constructed an independent breast cancer dataset from The Cancer Genome Atlas (TCGA).
 
 **Source:** [Breast Invasive Carcinoma (TCGA, PanCancer Atlas)](https://www.cbioportal.org/study/summary?id=brca_tcga_pan_can_atlas_2018)
 
@@ -74,12 +74,12 @@ Runs the full primary analysis pipeline on the METABRIC cohort, including clinic
 python copula-risk-fusion-gene-expression-ml.py
 ```
 
-**Script 2 — External Validation in TCGA** (`external_validation_tcga.py`):
+**Script 2 — External Evaluation in TCGA** (`external_evaluation_tcga.py`):
 
-Runs the harmonized external-validation pipeline. Trains clinical and gene-expression models on harmonized METABRIC data, fits copulas on the training scores, and evaluates all three scores (clinical, gene-expression, copula-fused) in the independent TCGA cohort. Outputs are saved to `harmonized_external_validation_outputs/`.
+Runs the harmonized external-evaluation pipeline. Trains clinical and gene-expression models on harmonized METABRIC data, fits copulas on the training scores, and evaluates all three scores (clinical, gene-expression, copula-fused) in the independent TCGA cohort. 
 
 ```bash
-python external_validation_tcga.py
+python external_evaluation_tcga.py
 ```
 
 Both scripts require `METABRIC_RNA_Mutation.csv` in the working directory. Script 2 additionally requires `tcga_final_dataset.csv`. Download the METABRIC CSV from Kaggle; to construct the TCGA dataset, run the provided R script (`R-code-for-tcga-data-generation.txt`) after downloading the raw clinical and expression files from cBioPortal.
@@ -109,8 +109,8 @@ If you use this code or method in your own work, please cite:
 For questions or collaborations, feel free to contact:
 
 **Agnideep Aich**
-Department of Mathematics, University of Louisiana at Lafayette
-📧 agnideep.aich1@louisiana.edu
+Department of Emergency Medicine, Stanford University
+📧 agnideep@stanford.edu
 
 ## 📝 License
 
