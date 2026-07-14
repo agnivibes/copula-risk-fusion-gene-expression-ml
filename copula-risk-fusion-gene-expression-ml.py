@@ -1,4 +1,4 @@
-#For METABRIC
+# Primary METABRIC copula-risk fusion analysis
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -31,6 +31,54 @@ except ImportError:
     HAS_XGB = False
     print("xgboost not installed; XGBClassifier will be skipped.")
 
+
+# ============================================================
+# GPU CONFIG (Colab-ready). Auto-detects an NVIDIA GPU and routes
+# XGBoost to CUDA. Set USE_GPU_XGB = False to force CPU if needed.
+# Only XGBoost is GPU-accelerated; RandomForest / GradientBoosting /
+# permutation importance run multi-core on CPU via n_jobs=-1.
+# ============================================================
+USE_GPU_XGB = True
+import shutil as _shutil, subprocess as _subprocess
+def _detect_gpu():
+    if not USE_GPU_XGB or _shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        return _subprocess.run(["nvidia-smi"],
+                               stdout=_subprocess.DEVNULL,
+                               stderr=_subprocess.DEVNULL).returncode == 0
+    except Exception:
+        return False
+_USE_GPU = _detect_gpu()
+_XGB_KW = {"tree_method": "hist", "device": "cuda"} if _USE_GPU else {"tree_method": "hist"}
+print(f"[config] XGBoost device: {'cuda (GPU)' if _USE_GPU else 'cpu (hist)'}")
+STRICT_INPUT_CHECKS = True  # hard-stop guards against truncated / wrong input data
+
+
+def _pkg_versions():
+    import sklearn, scipy
+    v = {"numpy": np.__version__, "pandas": pd.__version__,
+         "scipy": scipy.__version__, "sklearn": sklearn.__version__}
+    try:
+        import xgboost; v["xgboost"] = xgboost.__version__
+    except Exception:
+        v["xgboost"] = "not installed"
+    try:
+        import lifelines; v["lifelines"] = lifelines.__version__
+    except Exception:
+        v["lifelines"] = "not installed"
+    return v
+
+
+def xgb_actual_device(pipe):
+    """Read the device the XGBoost booster actually trained on (config JSON),
+    so a CUDA request that silently fell back to CPU is detected."""
+    try:
+        clf = pipe.named_steps.get("clf")
+        cfg = json.loads(clf.get_booster().save_config())
+        return cfg.get("learner", {}).get("generic_param", {}).get("device", "unknown")
+    except Exception as e:
+        return f"unknown ({e})"
 try:
     from lifelines import KaplanMeierFitter
     from lifelines.statistics import logrank_test
@@ -47,6 +95,10 @@ except ImportError:
 def load_metabric(csv_path="METABRIC_RNA_Mutation.csv"):
     df = pd.read_csv(csv_path, low_memory=False)
     print(f"Loaded METABRIC: {df.shape[0]} patients, {df.shape[1]} columns")
+    if STRICT_INPUT_CHECKS:
+        assert df.shape == (1904, 693), (
+            f"METABRIC shape {df.shape} != (1904, 693); the input file looks "
+            f"truncated or wrong. Fix the data or set STRICT_INPUT_CHECKS = False.")
     return df
 
 
@@ -226,7 +278,8 @@ def build_ml_view(df, cols, y, view_name, random_state=42):
             random_state=random_state)),
     ]
     if HAS_XGB:
-        estimators.append(("xgboost", XGBClassifier(
+        estimators.append(("xgboost", XGBClassifier(**_XGB_KW,
+            
             n_estimators=500, learning_rate=0.05, max_depth=3,
             subsample=0.8, colsample_bytree=0.8,
             objective="binary:logistic", eval_metric="logloss",
@@ -239,8 +292,9 @@ def build_ml_view(df, cols, y, view_name, random_state=42):
 
     for name, clf in estimators:
         pipe = Pipeline([("pre", preprocessor), ("clf", clf)])
+        cv_njobs = 1 if (name == "xgboost" and _USE_GPU) else -1
         cv_probs = cross_val_predict(
-            pipe, X, y, cv=skf, method="predict_proba", n_jobs=-1
+            pipe, X, y, cv=skf, method="predict_proba", n_jobs=cv_njobs
         )[:, 1]
         a = roc_auc_score(y, cv_probs)
         print(f"  {name}: AUC = {a:.4f}")
@@ -594,6 +648,88 @@ def plot_km_joint_risk(time, status, risk_clin, risk_gen, outdir):
         json.dump(info, f, indent=2)
 
 
+def plot_km_overall_survival_fullcohort(df_full, model_clin, clinical_ml_cols,
+                                        model_gen, expr_cols, outdir,
+                                        oof_pid=None, oof_clin=None, oof_gen=None):
+    """Kaplan-Meier for TRUE overall survival on the FULL METABRIC cohort.
+
+    Every death (any cause) is an event, coded from overall_survival == 0
+    (METABRIC Kaggle: 0 = dead, 1 = alive). Analytic-cohort patients keep their
+    out-of-fold scores from the selected pipeline; patients excluded from the
+    binary endpoint receive out-of-sample predictions from the final models
+    fitted on the analytic cohort. Risk-group thresholds are the medians of the
+    analytic out-of-fold scores.
+    """
+    if not HAS_LIFELINES:
+        print("  lifelines not available - skipping overall-survival KM")
+        return
+    miss_c = [c for c in clinical_ml_cols if c not in df_full.columns]
+    miss_g = [c for c in expr_cols if c not in df_full.columns]
+    if miss_c or miss_g:
+        print("  Schema mismatch - skipping overall-survival KM.")
+        return
+    risk_clin = model_clin.predict_proba(df_full[clinical_ml_cols])[:, 1]
+    risk_gen = model_gen.predict_proba(df_full[expr_cols])[:, 1]
+    if oof_pid is not None and "patient_id" in df_full.columns:
+        cmap = {str(p): float(x) for p, x in zip(oof_pid, oof_clin)}
+        gmap = {str(p): float(x) for p, x in zip(oof_pid, oof_gen)}
+        pid_full = df_full["patient_id"].astype(str).values
+        n_oof = 0
+        for i, pid in enumerate(pid_full):
+            if pid in cmap:
+                risk_clin[i] = cmap[pid]; risk_gen[i] = gmap[pid]; n_oof += 1
+        print(f"  KM scores: {n_oof} analytic patients use out-of-fold scores; "
+              f"{len(pid_full) - n_oof} excluded patients use out-of-sample predictions.")
+    time = df_full["overall_survival_months"].astype(float).values
+    # All-cause death: overall_survival == 0 (dead) in the METABRIC Kaggle CSV.
+    status = (pd.to_numeric(df_full["overall_survival"], errors="coerce").values == 0).astype(int)
+    valid = ~np.isnan(time)
+    time, status = time[valid], status[valid]
+    risk_clin, risk_gen = risk_clin[valid], risk_gen[valid]
+    # Thresholds from the ANALYTIC out-of-fold scores (not full-cohort medians).
+    med_c = float(np.median(oof_clin)); med_g = float(np.median(oof_gen))
+    hc = risk_clin > med_c; hg = risk_gen > med_g
+    groups = {
+        "low-low": (~hc) & (~hg),
+        "high-clinical-only": hc & (~hg),
+        "high-expression-only": (~hc) & hg,
+        "high-both": hc & hg,
+    }
+    kmf = KaplanMeierFitter()
+    plt.figure(figsize=(7, 6))
+    counts = {k: int(m.sum()) for k, m in groups.items()}
+    for label, mask in groups.items():
+        if mask.sum() < 10:
+            continue
+        kmf.fit(time[mask], event_observed=status[mask], label=f"{label} (n={int(mask.sum())})")
+        kmf.plot(ci_show=False)
+    m_hb, m_ll = groups["high-both"], groups["low-low"]
+    lr_p = float("nan")
+    if m_hb.sum() >= 10 and m_ll.sum() >= 10:
+        lr = logrank_test(time[m_hb], time[m_ll],
+                          event_observed_A=status[m_hb], event_observed_B=status[m_ll])
+        lr_p = float(lr.p_value)
+        plt.title("KM by joint risk strata - overall survival (full cohort)\n"
+                  f"(median split; log-rank high-both vs low-low p={lr_p:.2e})")
+    else:
+        plt.title("KM by joint risk strata - overall survival (full cohort)")
+    plt.xlabel("Time (months)"); plt.ylabel("Overall survival probability")
+    plt.tight_layout()
+    plt.savefig(outdir / "km_joint_risk_overall_survival.png", dpi=300); plt.close()
+    pd.DataFrame([{"group": k, "n": v} for k, v in counts.items()]).to_csv(
+        outdir / "km_overall_survival_group_counts.csv", index=False)
+    with open(outdir / "km_overall_survival_summary.json", "w") as f:
+        json.dump({"event_definition": "all-cause death (overall_survival == 0)",
+                   "cohort": "full METABRIC (1904)",
+                   "n_scored": int(len(time)),
+                   "n_events": int(status.sum()),
+                   "threshold_clinical_from_analytic_oof": med_c,
+                   "threshold_gene_from_analytic_oof": med_g,
+                   "group_counts": counts,
+                   "logrank_high_both_vs_low_low_p": lr_p}, f, indent=2)
+    print(f"  Overall-survival KM group counts: {counts}; log-rank p={lr_p:.2e}")
+
+
 def compute_copula_joint_risk(u, v, copula_cdf, params, y, outdir):
     """
     Copula-based continuous joint risk score.
@@ -658,7 +794,7 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
     deaths are present in the event coding.
 
     Risk scores are constructed to avoid in-sample optimism in the risk-group
-    definition. Patients in the analytic cohort receive their leakage-free
+    definition. Patients in the analytic cohort receive their out-of-fold
     out-of-fold (cross-validated) risk scores; the remaining patients (those
     excluded from the endpoint, e.g. other-cause deaths, who were never used to
     train any model) receive genuine out-of-sample predictions from the fitted
@@ -692,7 +828,7 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
         print("  Skipping competing-risks plot.")
         return
 
-    # Overwrite analytic-cohort patients with their leakage-free out-of-fold
+    # Overwrite analytic-cohort patients with their out-of-fold
     # scores so that the risk-group definition is not circular.
     if oof_pid is not None and "patient_id" in df_full.columns:
         cmap = {str(p): float(s) for p, s in zip(oof_pid, oof_clin)}
@@ -718,7 +854,13 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
     time, event = time[valid], event[valid]
     risk_clin, risk_gen = risk_clin[valid], risk_gen[valid]
 
-    med_c, med_g = np.median(risk_clin), np.median(risk_gen)
+    # Use the SAME strata cutoffs as the overall-survival KM: medians of the
+    # analytic out-of-fold scores, NOT full-cohort medians, so that Figure 6
+    # (KM) and Figure 7 (competing risks) define identical risk groups.
+    if oof_clin is not None and oof_gen is not None:
+        med_c, med_g = float(np.median(oof_clin)), float(np.median(oof_gen))
+    else:
+        med_c, med_g = np.median(risk_clin), np.median(risk_gen)
     hc = risk_clin > med_c
     hg = risk_gen > med_g
 
@@ -784,6 +926,21 @@ def competing_risks_cif(df_full, model_clin, clinical_ml_cols,
 # 9.  MAIN PIPELINE
 # ======================================================================
 
+def _fit_unpenalized_logistic(X, y):
+    """Support both current and older scikit-learn penalty syntax."""
+    last_error = None
+    for penalty in (None, "none"):
+        try:
+            model = LogisticRegression(
+                penalty=penalty, solver="lbfgs", max_iter=5000
+            )
+            model.fit(X, y)
+            return model
+        except (TypeError, ValueError) as exc:
+            last_error = exc
+    raise RuntimeError("Unable to fit unpenalized logistic regression.") from last_error
+
+
 # ======================================================================
 # 8b.  CALIBRATION ASSESSMENT  (Editor point 1: Hosmer-Lemeshow etc.)
 # ======================================================================
@@ -819,8 +976,7 @@ def calibration_slope_intercept(y, p, eps=1e-6):
     Ideal slope=1, intercept=0; slope<1 indicates over-dispersed risks."""
     y = np.asarray(y, float); p = np.clip(np.asarray(p, float), eps, 1 - eps)
     logit = np.log(p / (1 - p)).reshape(-1, 1)
-    lr = LogisticRegression(penalty=None, solver="lbfgs", max_iter=1000)
-    lr.fit(logit, y)
+    lr = _fit_unpenalized_logistic(logit, y)
     slope = float(lr.coef_[0, 0])
     a = 0.0
     for _ in range(100):
@@ -840,6 +996,60 @@ def integrated_calibration_index(y, p):
     y = np.asarray(y, float); p = np.asarray(p, float)
     obs = IsotonicRegression(out_of_bounds="clip").fit_transform(p, y)
     return float(np.mean(np.abs(obs - p)))
+
+
+def safe_logit(p, eps=1e-6):
+    p = np.clip(np.asarray(p, dtype=float), eps, 1.0 - eps)
+    return np.log(p / (1.0 - p))
+
+
+def _calibration_predictor(score, score_type):
+    score = np.asarray(score, dtype=float)
+    if score_type == "probability":
+        score = safe_logit(score)
+    elif score_type != "continuous":
+        raise ValueError("score_type must be 'probability' or 'continuous'")
+    return score.reshape(-1, 1)
+
+
+def fit_recalibration_model(y, score, score_type):
+    return _fit_unpenalized_logistic(
+        _calibration_predictor(score, score_type), np.asarray(y, dtype=int))
+
+
+def apply_recalibration_model(model, score, score_type):
+    return model.predict_proba(_calibration_predictor(score, score_type))[:, 1]
+
+
+def cross_fitted_recalibration(y, score, score_type, n_splits=5, random_state=42):
+    """Second-stage cross-fitted recalibration of out-of-fold scores.
+
+    Returns cross-fitted calibrated probabilities (for honest internal estimates)
+    and a final map fitted on all scores for transport. The raw copula CDF must
+    be passed with score_type='continuous' so it is mapped to a probability
+    BEFORE any Brier/HL/slope/ICI calculation.
+    """
+    y = np.asarray(y, dtype=int)
+    score = np.asarray(score, dtype=float)
+    if len(y) != len(score) or np.isnan(score).any():
+        raise ValueError("Invalid score vector supplied for recalibration.")
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    calibrated_oof = np.full(len(y), np.nan, dtype=float)
+    for tr, te in splitter.split(np.zeros(len(y)), y):
+        m = fit_recalibration_model(y[tr], score[tr], score_type)
+        calibrated_oof[te] = apply_recalibration_model(m, score[te], score_type)
+    if np.isnan(calibrated_oof).any():
+        raise RuntimeError("Cross-fitted recalibration produced missing predictions.")
+    final_model = fit_recalibration_model(y, score, score_type)
+    return calibrated_oof, final_model
+
+
+def format_p(p):
+    if p < 0.001:
+        return "p<0.001"
+    if p < 0.01:
+        return f"p={p:.3f}"
+    return f"p={p:.2f}"
 
 
 def calibration_report(scores_dict, y, outdir, tag="metabric"):
@@ -863,7 +1073,7 @@ def calibration_report(scores_dict, y, outdir, tag="metabric"):
                      "calibration_intercept": si["intercept"],
                      "ici": ici})
         frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="quantile")
-        plt.plot(mean_pred, frac_pos, marker="o", label=f"{name} (HL p={hl['p_value']:.2f})")
+        plt.plot(mean_pred, frac_pos, marker="o", label=f"{name} (HL {format_p(hl['p_value'])})")
         print(f"  [{name}] Brier={brier:.4f}  HL p={hl['p_value']:.3f}  "
               f"slope={si['slope']:.3f}  intercept={si['intercept']:.3f}  ICI={ici:.4f}")
     plt.xlabel("Mean predicted risk"); plt.ylabel("Observed event fraction")
@@ -878,68 +1088,154 @@ def calibration_report(scores_dict, y, outdir, tag="metabric"):
 # 8c.  FEATURE IMPORTANCE  (Editor point 3: key genes + interpretability)
 # ======================================================================
 
-def feature_importance_report(fitted_model, X, y, cols, view_name, outdir,
-                              topn=20, n_repeats=20, test_size=0.30,
-                              random_state=42):
-    """Feature importance for a fitted pipeline over the ORIGINAL predictor
-    columns, computed two complementary ways:
+def feature_importance_report(
+    fitted_model, X, y, cols, view_name, outdir,
+    topn=20, n_splits=5, n_repeats=5, random_state=42,
+    importance_n_jobs=-1
+):
+    """Repeated cross-validated permutation importance over original columns.
 
-      * Out-of-sample permutation importance (scoring=ROC-AUC): the pipeline is
-        refit on a stratified training split and each column is permuted on a
-        held-out split. This avoids the in-sample saturation that makes
-        permutation importance vanish for a memorised high-dimensional model.
-      * Impurity (Gini) importance from the final tree ensemble, when available,
-        which is the conventional and robust choice for highly correlated
-        gene-expression predictors.
-
-    The table is ranked by impurity importance when the final estimator is a
-    tree ensemble whose importances align 1-to-1 with the input columns (the
-    numeric-only gene-expression view); otherwise it is ranked by out-of-sample
-    permutation importance (the mixed-type clinical view)."""
-    from sklearn.inspection import permutation_importance
+    The primary ranking is the mean held-out ROC-AUC reduction after permutation.
+    Tree impurity importance is retained only as a secondary descriptive column.
+    """
     from sklearn.base import clone
-    from sklearn.model_selection import train_test_split
+    from sklearn.inspection import permutation_importance
+    from joblib import parallel_backend
 
-    Xc = X[cols]
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        Xc, y, test_size=test_size, stratify=y, random_state=random_state)
-    est = clone(fitted_model)
-    est.fit(X_tr, y_tr)
-    r = permutation_importance(est, X_te, y_te, scoring="roc_auc",
-                               n_repeats=n_repeats, random_state=random_state,
-                               n_jobs=-1)
-    imp = pd.DataFrame({"feature": cols,
-                        "perm_importance_mean": r.importances_mean,
-                        "perm_importance_std": r.importances_std})
+    X_view = X[cols].copy()
+    y_array = y.to_numpy() if hasattr(y, "to_numpy") else np.asarray(y)
+    splitter = StratifiedKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
 
-    rank_col = "perm_importance_mean"
-    try:
-        clf = est.named_steps["clf"]
-        fi = getattr(clf, "feature_importances_", None)
-        if fi is not None and len(fi) == len(cols):
-            imp["impurity_importance"] = fi
-            rank_col = "impurity_importance"
-    except Exception:
-        pass
+    permutation_values = {feature: [] for feature in cols}
+    impurity_values = []
+    fold_rows = []
 
-    imp = imp.sort_values(rank_col, ascending=False).reset_index(drop=True)
-    imp.to_csv(outdir / f"feature_importance_{view_name}.csv", index=False)
+    for fold, (train_idx, test_idx) in enumerate(
+        splitter.split(X_view, y_array), start=1
+    ):
+        estimator = clone(fitted_model)
+        # Avoid nested process pools. The outer permutation work uses threads,
+        # while the fitted classifier uses one thread during this section.
+        if "clf__n_jobs" in estimator.get_params(deep=True):
+            estimator.set_params(clf__n_jobs=1)
+        X_train, X_test = X_view.iloc[train_idx], X_view.iloc[test_idx]
+        y_train, y_test = y_array[train_idx], y_array[test_idx]
+        estimator.fit(X_train, y_train)
 
-    top = imp.head(topn).iloc[::-1]
-    plt.figure(figsize=(7, max(4, 0.32 * len(top))))
-    if rank_col == "impurity_importance":
-        plt.barh(top["feature"], top["impurity_importance"], color="#4C72B0")
-        plt.xlabel("Random-forest impurity importance")
-    else:
-        plt.barh(top["feature"], top["perm_importance_mean"],
-                 xerr=top["perm_importance_std"], color="#4C72B0")
-        plt.xlabel("Out-of-sample permutation importance (mean AUC drop)")
-    plt.title(f"Top {topn} features — {view_name}")
-    plt.tight_layout(); plt.savefig(outdir / f"feature_importance_{view_name}.png", dpi=300)
+        probability = estimator.predict_proba(X_test)[:, 1]
+        fold_auc = roc_auc_score(y_test, probability)
+        fold_rows.append({
+            "fold": fold, "test_auc": fold_auc, "n_test": len(test_idx)
+        })
+
+        with parallel_backend("threading", n_jobs=importance_n_jobs):
+            result = permutation_importance(
+                estimator, X_test, y_test,
+                scoring="roc_auc", n_repeats=n_repeats,
+                random_state=random_state + fold,
+                n_jobs=importance_n_jobs
+            )
+        for j, feature in enumerate(cols):
+            permutation_values[feature].extend(result.importances[j, :].tolist())
+
+        try:
+            classifier = estimator.named_steps["clf"]
+            fold_impurity = getattr(classifier, "feature_importances_", None)
+            if fold_impurity is not None and len(fold_impurity) == len(cols):
+                impurity_values.append(np.asarray(fold_impurity, dtype=float))
+        except Exception:
+            pass
+
+    rows = []
+    for feature in cols:
+        values = np.asarray(permutation_values[feature], dtype=float)
+        rows.append({
+            "feature": feature,
+            "perm_importance_mean": float(values.mean()),
+            "perm_importance_sd": float(values.std(ddof=1)),
+            "perm_importance_median": float(np.median(values)),
+            "perm_importance_q025": float(np.quantile(values, 0.025)),
+            "perm_importance_q975": float(np.quantile(values, 0.975)),
+            "positive_importance_fraction": float(np.mean(values > 0)),
+            "n_importance_estimates": int(len(values)),
+        })
+
+    importance = pd.DataFrame(rows)
+    if impurity_values:
+        impurity_matrix = np.vstack(impurity_values)
+        importance["impurity_importance_mean"] = impurity_matrix.mean(axis=0)
+        importance["impurity_importance_sd"] = impurity_matrix.std(axis=0, ddof=1)
+
+    importance["stable_positive"] = (
+        (importance["perm_importance_q025"] > 0) &
+        (importance["positive_importance_fraction"] >= 0.80)
+    )
+    importance = importance.sort_values(
+        "perm_importance_mean", ascending=False
+    ).reset_index(drop=True)
+
+    importance.to_csv(
+        outdir / f"feature_importance_{view_name}.csv", index=False
+    )
+    importance.loc[importance["stable_positive"]].to_csv(
+        outdir / f"feature_importance_{view_name}_stable_positive.csv",
+        index=False
+    )
+    pd.DataFrame(fold_rows).to_csv(
+        outdir / f"feature_importance_{view_name}_fold_performance.csv",
+        index=False
+    )
+
+    top = importance.head(topn).iloc[::-1]
+    plt.figure(figsize=(8, max(4, 0.35 * len(top))))
+    plt.barh(
+        top["feature"], top["perm_importance_mean"],
+        xerr=top["perm_importance_sd"]
+    )
+    plt.axvline(0, linewidth=1)
+    plt.xlabel(
+        "Repeated cross-validated permutation importance\n"
+        "(mean held-out ROC-AUC reduction)"
+    )
+    plt.ylabel("Feature")
+    plt.title(f"Top {topn} features: {view_name}")
+    plt.tight_layout()
+    plt.savefig(
+        outdir / f"feature_importance_{view_name}.png",
+        dpi=300, bbox_inches="tight"
+    )
     plt.close()
-    print(f"  [{view_name}] ranked by {rank_col}; top features: "
-          + ", ".join(imp['feature'].head(12).tolist()))
-    return imp
+
+    print(f"  [{view_name}] primary ranking: repeated CV permutation importance")
+    print("  Top features: " + ", ".join(importance["feature"].head(15)))
+    print(
+        f"  Stable positive features: {int(importance['stable_positive'].sum())}"
+    )
+
+    # Permutation-vs-impurity concordance (tests the "consistent with impurity"
+    # claim rather than assuming it): Spearman rho and top-20 overlap.
+    concordance = {"view": view_name}
+    if "impurity_importance_mean" in importance.columns:
+        from scipy.stats import spearmanr
+        rho, pval = spearmanr(importance["perm_importance_mean"],
+                              importance["impurity_importance_mean"])
+        perm_top = set(importance.sort_values("perm_importance_mean", ascending=False).head(20)["feature"])
+        imp_top = set(importance.sort_values("impurity_importance_mean", ascending=False).head(20)["feature"])
+        overlap = len(perm_top & imp_top)
+        concordance.update({"spearman_perm_vs_impurity": float(rho),
+                            "spearman_p_value": float(pval),
+                            "top20_overlap_count": int(overlap),
+                            "top20_overlap_fraction": overlap / 20.0})
+        print(f"  [{view_name}] permutation-vs-impurity Spearman={rho:.3f} "
+              f"(p={pval:.3g}); top-20 overlap={overlap}/20")
+    else:
+        concordance.update({"spearman_perm_vs_impurity": None,
+                            "note": "impurity importance unavailable for this view"})
+    pd.DataFrame([concordance]).to_csv(
+        outdir / f"feature_importance_{view_name}_concordance.csv", index=False)
+    return importance
 
 
 # ======================================================================
@@ -993,6 +1289,11 @@ def main():
     # ---- Load & endpoint ----
     df = load_metabric()
     y_5y = build_5year_endpoint(df)
+    if STRICT_INPUT_CHECKS:
+        _e = int((y_5y == 1).sum()); _n = int((y_5y == 0).sum()); _x = int(y_5y.isna().sum())
+        assert (_e, _n, _x) == (325, 1038, 541), (
+            f"Primary cancer-specific endpoint {(_e, _n, _x)} != (325, 1038, 541); "
+            f"input may be truncated or wrong.")
 
     mask_valid = ~y_5y.isna()
     df = df.loc[mask_valid].reset_index(drop=True)
@@ -1002,6 +1303,9 @@ def main():
 
     # ---- Feature views ----
     clinical_cols, expr_cols, mut_cols = split_views(df)
+    if STRICT_INPUT_CHECKS:
+        assert len(expr_cols) == 489, (
+            f"Expression feature count {len(expr_cols)} != 489; input may be wrong.")
 
     # BUG-1 FIX: exclude patient_id and survival columns
     exclude_from_clinical = {"overall_survival_months", "overall_survival",
@@ -1022,6 +1326,19 @@ def main():
     print("="*60)
     best_g, model_g, risk_gen, met_g = build_ml_view(
         df, expr_cols, y, "gene-expression")
+
+    # ---- Verify actual XGBoost device + record environment (Phoenix point 7) ----
+    xgb_device_used = None
+    for _nm, _mdl in [(best_c, model_c), (best_g, model_g)]:
+        if _nm == "xgboost":
+            xgb_device_used = xgb_actual_device(_mdl)
+            print(f"  [device check] XGBoost booster trained on: {xgb_device_used}")
+    with open(outdir / "run_environment.json", "w") as _f:
+        import json as _json
+        _json.dump({"xgboost_config_device": ("cuda" if _USE_GPU else "cpu"),
+                    "xgboost_actual_booster_device": xgb_device_used,
+                    "package_versions": _pkg_versions(), "seed": 42,
+                    "strict_input_checks": STRICT_INPUT_CHECKS}, _f, indent=2)
 
     # ---- Bootstrap AUC CIs (REV2) ----
     print("\n--- Bootstrap AUC 95% CIs ---")
@@ -1054,13 +1371,12 @@ def main():
     plot_roc_curves(y, {"clinical": risk_clin, "gene-expression": risk_gen},
                     outdir, ci_dict=ci_dict)
 
-    # ---- KM survival ----
-    print("\n--- Kaplan-Meier by joint risk strata ---")
-    time_arr = df["overall_survival_months"].astype(float).values
-    raw_st = df["death_from_cancer"]
-    s_low = raw_st.astype(str).str.strip().str.lower()
-    status_surv = s_low.isin({"died of disease","died","dead","deceased"}).astype(int).values
-    plot_km_joint_risk(time_arr, status_surv, risk_clin, risk_gen, outdir)
+    # ---- KM: TRUE overall survival on the FULL 1904 cohort (all-cause death) ----
+    print("\n--- Kaplan-Meier (overall survival, full cohort) by joint risk strata ---")
+    df_full_km = load_metabric()
+    plot_km_overall_survival_fullcohort(
+        df_full_km, model_c, clinical_ml_cols, model_g, expr_cols, outdir,
+        oof_pid=df["patient_id"].values, oof_clin=risk_clin, oof_gen=risk_gen)
 
     # ---- Competing risks CIF (REV1-9) ----
     print("\n--- Competing risks analysis ---")
@@ -1150,8 +1466,17 @@ def main():
     gof_df.to_csv(outdir/"copula_gof_cvm.csv", index=False)
     print(f"\n  GOF summary:\n{gof_df.to_string(index=False)}")
 
-    best_cop = gof_df.loc[gof_df["p_value"].idxmax(), "copula"]
-    print(f"\n  Best-fitting copula: {best_cop}")
+    best_cop = gof_df.loc[gof_df["cvm_stat"].idxmin(), "copula"]
+    selected_cvm = float(
+        gof_df.loc[gof_df["copula"] == best_cop, "cvm_stat"].iloc[0]
+    )
+    selected_gof_p = float(
+        gof_df.loc[gof_df["copula"] == best_cop, "p_value"].iloc[0]
+    )
+    print(f"\n  Selected copula: {best_cop}")
+    print("  Selection criterion: minimum Cramer-von Mises statistic")
+    print(f"  Selected CvM statistic = {selected_cvm:.6f}")
+    print(f"  Bootstrap GOF p-value = {selected_gof_p:.4f}")
 
     # ---- REV1-8: Copula-based continuous joint risk score ----
     best_spec = copula_specs[best_cop]
@@ -1174,14 +1499,29 @@ def main():
     print("="*60)
     fusion_df = fusion_baselines(risk_clin, risk_gen, u, v, y, joint_score, outdir)
 
-    # ---- Calibration assessment (Editor point 1: Hosmer-Lemeshow etc.) ----
-    print("\n" + "="*60)
-    print("CALIBRATION ASSESSMENT (5-year cancer-specific death, METABRIC)")
-    print("="*60)
-    calib_df = calibration_report(
-        {"clinical": risk_clin, "gene-expression": risk_gen}, y, outdir,
-        tag="metabric_cancer_specific")
-    print(f"\n  Calibration summary:\n{calib_df.to_string(index=False)}")
+    # ---- Primary cancer-specific calibration (fair: same treatment for all three) ----
+    print("\n" + "=" * 60)
+    print("CALIBRATION (primary cancer-specific endpoint)")
+    print("=" * 60)
+    yv = y.values
+    # Raw-probability diagnostics are valid ONLY for the two model probabilities.
+    # The copula-fused score is a rank-based CDF value, NOT a probability, so it is
+    # not given Brier/HL/slope/ICI until mapped to a probability by recalibration.
+    print("Raw model-probability calibration (clinical, gene-expression only):")
+    calibration_report({"clinical (raw)": risk_clin,
+                        "gene-expression (raw)": risk_gen},
+                       yv, outdir, tag="metabric_cancer_specific_raw")
+    # Fair comparison: same second-stage cross-fitted recalibration of OOF scores
+    # for all three, including the copula mapped to a probability.
+    clin_cal, _ = cross_fitted_recalibration(yv, risk_clin, "probability")
+    gene_cal, _ = cross_fitted_recalibration(yv, risk_gen, "probability")
+    fused_cal, _ = cross_fitted_recalibration(yv, joint_score, "continuous")
+    print("Cross-fitted recalibrated calibration (all three, fair comparison):")
+    calibration_report({"clinical (recal.)": clin_cal,
+                        "gene-expression (recal.)": gene_cal,
+                        "copula-fused (recal.)": fused_cal},
+                       yv, outdir, tag="metabric_cancer_specific_recalibrated")
+
 
     # ---- Feature importance (Editor point 3: key genes + interpretability) ----
     print("\n" + "="*60)
