@@ -1,6 +1,7 @@
 # Harmonized METABRIC-to-TCGA external evaluation
 
 import warnings
+
 warnings.filterwarnings('ignore')
 
 import json
@@ -23,10 +24,10 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
 try:
     from xgboost import XGBClassifier
+
     HAS_XGB = True
 except Exception:
     HAS_XGB = False
-
 
 # ============================================================
 # GPU CONFIG (Colab-ready). Auto-detects an NVIDIA GPU and routes
@@ -36,6 +37,8 @@ except Exception:
 # ============================================================
 USE_GPU_XGB = True
 import shutil as _shutil, subprocess as _subprocess
+
+
 def _detect_gpu():
     if not USE_GPU_XGB or _shutil.which("nvidia-smi") is None:
         return False
@@ -45,6 +48,8 @@ def _detect_gpu():
                                stderr=_subprocess.DEVNULL).returncode == 0
     except Exception:
         return False
+
+
 _USE_GPU = _detect_gpu()
 _XGB_KW = {"tree_method": "hist", "device": "cuda"} if _USE_GPU else {"tree_method": "hist"}
 print(f"[config] XGBoost device: {'cuda (GPU)' if _USE_GPU else 'cpu (hist)'}")
@@ -56,11 +61,13 @@ def _pkg_versions():
     v = {"numpy": np.__version__, "pandas": pd.__version__,
          "scipy": scipy.__version__, "sklearn": sklearn.__version__}
     try:
-        import xgboost; v["xgboost"] = xgboost.__version__
+        import xgboost;
+        v["xgboost"] = xgboost.__version__
     except Exception:
         v["xgboost"] = "not installed"
     try:
-        import lifelines; v["lifelines"] = lifelines.__version__
+        import lifelines;
+        v["lifelines"] = lifelines.__version__
     except Exception:
         v["lifelines"] = "not installed"
     return v
@@ -74,10 +81,14 @@ def xgb_actual_device(pipe):
         return cfg.get("learner", {}).get("generic_param", {}).get("device", "unknown")
     except Exception as e:
         return f"unknown ({e})"
+
+
 try:
     import matplotlib
+
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+
     HAS_PLOT = True
 except Exception:
     HAS_PLOT = False
@@ -97,6 +108,7 @@ TCGA_DEAD_VALUE = 1
 METABRIC_PATH = 'METABRIC_RNA_Mutation.csv'
 TCGA_PATH = 'tcga_final_dataset.csv'
 OUTDIR = Path('harmonized_external_evaluation_outputs')
+
 
 # ============================================================
 # 2. HELPERS
@@ -288,12 +300,12 @@ def fit_and_oof(X, y, num_cols, cat_cols, random_state=42):
     ]
     if HAS_XGB:
         models.append(('xgboost', XGBClassifier(**_XGB_KW,
-            
-            n_estimators=500, learning_rate=0.05, max_depth=3,
-            subsample=0.8, colsample_bytree=0.8,
-            objective='binary:logistic', eval_metric='logloss',
-            random_state=random_state, n_jobs=-1
-        )))
+
+                                                n_estimators=500, learning_rate=0.05, max_depth=3,
+                                                subsample=0.8, colsample_bytree=0.8,
+                                                objective='binary:logistic', eval_metric='logloss',
+                                                random_state=random_state, n_jobs=-1
+                                                )))
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
 
@@ -325,6 +337,7 @@ def ecdf_from_train(train_scores, test_scores):
     sorter = np.sort(train_scores)
     ranks = np.searchsorted(sorter, test_scores, side='right')
     return np.clip(ranks / (len(sorter) + 1.0), EPS, 1 - EPS)
+
 
 # ============================================================
 # 3. COPULAS
@@ -499,6 +512,7 @@ def cvm_gof_bootstrap(u, v, cdf_fn, sim_fn, fit_fn, params, n_bootstrap=300, ran
     pval = (1 + np.sum(sims >= obs)) / (n_bootstrap + 1)
     return obs, float(pval)
 
+
 # ============================================================
 # 4. DATA BUILDING
 # ============================================================
@@ -602,20 +616,21 @@ def get_common_genes_and_clinical(metabric, tcga):
     met_gene_cols = {
         c for c in metabric.columns
         if c not in KNOWN_NON_GENE_COLUMNS
-        and not c.endswith('_MUT')
-        and pd.api.types.is_numeric_dtype(metabric[c])
-        and pd.to_numeric(metabric[c], errors='coerce').nunique(dropna=True) > 1
+           and not c.endswith('_MUT')
+           and pd.api.types.is_numeric_dtype(metabric[c])
+           and pd.to_numeric(metabric[c], errors='coerce').nunique(dropna=True) > 1
     }
     tcga_gene_cols = {
         c for c in tcga.columns
         if c not in KNOWN_NON_GENE_COLUMNS
-        and not c.endswith('_MUT')
-        and pd.api.types.is_numeric_dtype(tcga[c])
-        and pd.to_numeric(tcga[c], errors='coerce').nunique(dropna=True) > 1
+           and not c.endswith('_MUT')
+           and pd.api.types.is_numeric_dtype(tcga[c])
+           and pd.to_numeric(tcga[c], errors='coerce').nunique(dropna=True) > 1
     }
 
     common_genes = sorted(met_gene_cols.intersection(tcga_gene_cols))
     return shared_clinical, common_genes
+
 
 # ============================================================
 # 5. PLOTTING
@@ -636,16 +651,19 @@ def plot_roc(y_true, scores, labels, savepath):
     plt.savefig(savepath, dpi=300)
     plt.close()
 
+
 # ============================================================
 # 5b. CALIBRATION  (Editor point 1: Hosmer-Lemeshow etc.)
 # ============================================================
 def hosmer_lemeshow(y, p, g=10):
-    y = np.asarray(y, float); p = np.asarray(p, float)
+    y = np.asarray(y, float);
+    p = np.asarray(p, float)
     n = len(p)
     order = np.argsort(p, kind='mergesort')
     grp = np.empty(n, int)
     grp[order] = np.floor(np.arange(n) * g / n).astype(int)
-    chi2 = 0.0; used = 0
+    chi2 = 0.0;
+    used = 0
     for b in range(g):
         m = grp == b
         if m.sum() == 0:
@@ -796,9 +814,13 @@ def plot_calibration(scores_dict, y, savepath, title):
         frac_pos, mean_pred = calibration_curve(y, p, n_bins=nb, strategy='quantile')
         hl = hosmer_lemeshow(y, p)
         plt.plot(mean_pred, frac_pos, marker='o', label=f"{name} (HL {format_p(hl['p_value'])})")
-    plt.xlabel('Mean predicted risk'); plt.ylabel('Observed event fraction')
-    plt.title(title); plt.legend(loc='upper left')
-    plt.tight_layout(); plt.savefig(savepath, dpi=300); plt.close()
+    plt.xlabel('Mean predicted risk');
+    plt.ylabel('Observed event fraction')
+    plt.title(title);
+    plt.legend(loc='upper left')
+    plt.tight_layout();
+    plt.savefig(savepath, dpi=300);
+    plt.close()
 
 
 # ============================================================
@@ -821,10 +843,14 @@ def main():
     y_met = build_metabric_5y_overall(met)
     y_tcga = build_tcga_5y_overall(tcga)
     if STRICT_INPUT_CHECKS:
-        _e = int((y_met == 1).sum()); _n = int((y_met == 0).sum()); _x = int(y_met.isna().sum())
+        _e = int((y_met == 1).sum());
+        _n = int((y_met == 0).sum());
+        _x = int(y_met.isna().sum())
         assert (_e, _n, _x) == (412, 1432, 60), (
             f"METABRIC 5y overall endpoint {(_e, _n, _x)} != (412, 1432, 60).")
-        _e = int((y_tcga == 1).sum()); _n = int((y_tcga == 0).sum()); _x = int(y_tcga.isna().sum())
+        _e = int((y_tcga == 1).sum());
+        _n = int((y_tcga == 0).sum());
+        _x = int(y_tcga.isna().sum())
         assert (_e, _n, _x) == (85, 232, 664), (
             f"TCGA 5y overall endpoint {(_e, _n, _x)} != (85, 232, 664).")
 
@@ -932,7 +958,8 @@ def main():
 
     for name, spec in copulas.items():
         param = spec['fit'](u_train, v_train)
-        cvm, pval = cvm_gof_bootstrap(u_train, v_train, spec['cdf'], spec['sim'], spec['fit'], (param,), n_bootstrap=300, random_state=RANDOM_STATE)
+        cvm, pval = cvm_gof_bootstrap(u_train, v_train, spec['cdf'], spec['sim'], spec['fit'], (param,),
+                                      n_bootstrap=300, random_state=RANDOM_STATE)
         lamL, lamU = spec['tail'](param)
         copula_rows.append({
             'copula': name,
